@@ -1,4 +1,5 @@
 import boto3
+from botocore.client import Config
 from botocore.exceptions import ClientError, NoCredentialsError
 from typing import List, Dict, Optional, BinaryIO
 import os
@@ -16,14 +17,16 @@ class S3Client:
         aws_secret_key = settings_service.get_aws_secret_access_key()
         bucket_name = settings_service.s3_bucket_name
         
-        if not all([aws_access_key, aws_secret_key, bucket_name]):
-            raise ValueError("AWS credentials and S3 bucket name must be configured in application settings")
+        #if not all([aws_access_key, aws_secret_key, bucket_name]):
+        #   raise ValueError("AWS credentials and S3 bucket name must be configured in application settings")
         
         self.s3_client = boto3.client(
             's3',
             aws_access_key_id=aws_access_key,
             aws_secret_access_key=aws_secret_key,
-            region_name=settings_service.s3_region
+            region_name=settings_service.s3_region,
+            # testing this, may be required for signed url
+            config=Config(signature_version='s3v4'),
         )
         self.bucket_name = bucket_name
     

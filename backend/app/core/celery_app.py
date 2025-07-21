@@ -1,3 +1,10 @@
+try:
+    from collections.abc import Callable
+    import collections
+    if not hasattr(collections, 'Callable'):
+        collections.Callable = Callable
+except ImportError:
+    pass
 from celery import Celery
 from celery.signals import worker_process_init
 from app.core.config import settings

@@ -122,8 +122,8 @@ def test_aws_connection(
     """Test AWS S3 connection with current settings"""
     settings = db.query(ApplicationSetting).filter(ApplicationSetting.id == 1).first()
     
-    if not settings or not settings.aws_access_key_id or not settings.aws_secret_access_key:
-        raise HTTPException(status_code=400, detail="AWS credentials not configured")
+    #if not settings or not settings.aws_access_key_id or not settings.aws_secret_access_key:
+        #raise HTTPException(status_code=400, detail="AWS credentials not configured")
     
     try:
         import boto3
