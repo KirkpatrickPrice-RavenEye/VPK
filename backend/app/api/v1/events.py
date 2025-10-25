@@ -17,33 +17,74 @@ router = APIRouter()
 
 
 async def generate_job_events(job_id: str, user_id: str) -> AsyncGenerator[str, None]:
-    """Generate Server-Sent Events for job updates"""
+    """Generate Server-Sent Events for job updates, real-time logs, and pot file"""
     last_status = None
     last_progress = None
-    
+    last_status_message = None  # Track status message changes
+    last_log_position = 0  # Track bytes read from log file
+    last_pot_hash = None  # Track pot file changes using hash
+    initial_log_sent = False
+    initial_pot_sent = False
+
     while True:
         try:
             # Get fresh database session for each check
             db = next(get_db())
-            
+
             job = db.query(Job).filter(
                 Job.id == job_id,
                 Job.user_id == user_id
             ).first()
-            
+
             if not job:
                 yield f"event: error\ndata: {json.dumps({'error': 'Job not found'})}\n\n"
                 break
-            
-            # Check if job status or progress changed
+
+            # Send initial log content (last 50-100 lines) on first connection
+            if not initial_log_sent and job.log_file_path and os.path.exists(job.log_file_path):
+                try:
+                    with open(job.log_file_path, 'rb') as f:
+                        # Get file size
+                        f.seek(0, 2)  # Seek to end
+                        file_size = f.tell()
+
+                        # Read last ~100 lines (estimate 100 bytes per line = 10KB)
+                        read_size = min(10000, file_size)
+                        f.seek(max(0, file_size - read_size))
+
+                        initial_content = f.read().decode('utf-8', errors='replace')
+
+                        # Find the start of the first complete line
+                        if file_size > read_size:
+                            first_newline = initial_content.find('\n')
+                            if first_newline != -1:
+                                initial_content = initial_content[first_newline + 1:]
+
+                        if initial_content:
+                            lines = initial_content.split('\n')
+                            log_data = {
+                                "lines": lines,
+                                "append": False,  # Initial load, not append
+                                "complete": False
+                            }
+                            yield f"event: log_update\ndata: {json.dumps(log_data)}\n\n"
+
+                        last_log_position = file_size
+                    initial_log_sent = True
+                except Exception as log_error:
+                    print(f"Error reading initial log content: {log_error}")
+
+            # Check if job status, progress, or status_message changed
             status_changed = last_status != job.status.value
             progress_changed = last_progress != job.progress
-            
-            if status_changed or progress_changed:
+            message_changed = last_status_message != job.status_message
+
+            if status_changed or progress_changed or message_changed:
                 # Send job update event
                 event_data = {
                     "job_id": str(job.id),
                     "status": job.status.value,
+                    "status_message": job.status_message,
                     "progress": job.progress,
                     "error_message": job.error_message,
                     "time_started": job.time_started.isoformat() if job.time_started else None,
@@ -52,22 +93,101 @@ async def generate_job_events(job_id: str, user_id: str) -> AsyncGenerator[str, 
                     "estimated_time": job.estimated_time,
                     "timestamp": job.updated_at.isoformat()
                 }
-                
+
                 yield f"event: job_update\ndata: {json.dumps(event_data)}\n\n"
-                
+
                 last_status = job.status.value
                 last_progress = job.progress
-                
-                # If job is completed, failed, or cancelled, send final event and stop
-                if job.status.value in ['completed', 'failed', 'cancelled']:
-                    yield f"event: job_finished\ndata: {json.dumps(event_data)}\n\n"
-                    break
-            
+                last_status_message = job.status_message
+
+            # Stream new log content if available
+            if job.log_file_path and os.path.exists(job.log_file_path):
+                try:
+                    with open(job.log_file_path, 'rb') as f:
+                        # Get current file size
+                        f.seek(0, 2)
+                        current_size = f.tell()
+
+                        # If there's new content, send it
+                        if current_size > last_log_position:
+                            f.seek(last_log_position)
+                            new_content = f.read().decode('utf-8', errors='replace')
+
+                            if new_content:
+                                lines = new_content.split('\n')
+                                # Remove empty last line if content doesn't end with newline
+                                if lines and not lines[-1]:
+                                    lines = lines[:-1]
+
+                                if lines:
+                                    log_data = {
+                                        "lines": lines,
+                                        "append": True,  # Append to existing logs
+                                        "complete": job.status.value in ['completed', 'failed', 'cancelled']
+                                    }
+                                    yield f"event: log_update\ndata: {json.dumps(log_data)}\n\n"
+
+                            last_log_position = current_size
+                except Exception as log_error:
+                    print(f"Error reading log updates: {log_error}")
+
+            # Stream pot file (cracked passwords) updates
+            if job.pot_file_path and os.path.exists(job.pot_file_path):
+                try:
+                    import hashlib
+
+                    with open(job.pot_file_path, 'rb') as f:
+                        pot_content = f.read()
+
+                    # Calculate hash to detect changes
+                    current_hash = hashlib.md5(pot_content).hexdigest()
+
+                    # Send update if pot file changed or initial load
+                    if current_hash != last_pot_hash:
+                        # Decode and parse pot file
+                        pot_text = pot_content.decode('utf-8', errors='replace')
+                        lines = [line.strip() for line in pot_text.split('\n') if line.strip() and not line.startswith('#')]
+
+                        # Get last 100 lines for preview
+                        preview_lines = lines[-100:] if len(lines) > 100 else lines
+
+                        pot_data = {
+                            "total_cracked": len(lines),
+                            "preview": preview_lines,
+                            "truncated": len(lines) > 100,
+                            "complete": job.status.value in ['completed', 'failed', 'cancelled']
+                        }
+
+                        yield f"event: pot_update\ndata: {json.dumps(pot_data)}\n\n"
+                        last_pot_hash = current_hash
+
+                        if not initial_pot_sent:
+                            initial_pot_sent = True
+                except Exception as pot_error:
+                    print(f"Error reading pot file updates: {pot_error}")
+
+            # If job is completed, failed, or cancelled, send final event and stop
+            if job.status.value in ['completed', 'failed', 'cancelled']:
+                event_data = {
+                    "job_id": str(job.id),
+                    "status": job.status.value,
+                    "status_message": job.status_message,
+                    "progress": job.progress,
+                    "error_message": job.error_message,
+                    "time_started": job.time_started.isoformat() if job.time_started else None,
+                    "time_finished": job.time_finished.isoformat() if job.time_finished else None,
+                    "actual_cost": float(job.actual_cost) if job.actual_cost else 0.0,
+                    "estimated_time": job.estimated_time,
+                    "timestamp": job.updated_at.isoformat()
+                }
+                yield f"event: job_finished\ndata: {json.dumps(event_data)}\n\n"
+                break
+
             db.close()
-            
+
             # Wait before next check
             await asyncio.sleep(2)
-            
+
         except Exception as e:
             yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
             break

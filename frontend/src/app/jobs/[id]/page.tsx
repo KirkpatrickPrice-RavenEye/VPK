@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useEffect, useState, useCallback } from 'react';
+import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import Layout from '@/components/Layout';
 import { jobApi, Job } from '@/services/api';
@@ -8,20 +8,21 @@ import { Card, CardHeader, CardTitle, CardDescription, CardContent } from '@/com
 import { Button } from '@/components/ui/Button';
 import { Spinner } from '@/components/ui/Spinner';
 import { Alert } from '@/components/ui/Alert';
-import { 
-  ArrowLeft, 
-  Play, 
-  Square, 
-  Download, 
-  Clock, 
-  CheckCircle, 
-  XCircle, 
+import {
+  ArrowLeft,
+  Play,
+  Square,
+  Download,
+  Clock,
+  CheckCircle,
+  XCircle,
   FileText,
   Key,
   Target,
   TrendingUp,
   Trash2,
-  Loader2
+  Loader2,
+  ArrowDown
 } from 'lucide-react';
 
 interface JobWithStats extends Job {
@@ -41,6 +42,15 @@ export default function JobDetailPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [actionLoading, setActionLoading] = useState(false);
+  const [sseConnected, setSseConnected] = useState(false);
+  const [autoScroll, setAutoScroll] = useState(true);
+  const [sseInitialized, setSseInitialized] = useState(false);
+  const [sseConnectionTrigger, setSseConnectionTrigger] = useState(0);
+  const [crackedCount, setCrackedCount] = useState(0);
+  const logsEndRef = useRef<HTMLDivElement>(null);
+  const jobStatusRef = useRef<string>('');
+  const prevStatusRef = useRef<string>('');
+  const fetchJobDetailsRef = useRef<() => Promise<void>>();
 
   const fetchJobDetails = useCallback(async () => {
     try {
@@ -82,19 +92,259 @@ export default function JobDetailPage() {
 
   useEffect(() => {
     if (jobId) {
+      // Reset SSE flag when navigating to a different job
+      setSseInitialized(false);
+      setSseConnectionTrigger(prev => prev + 1);
       fetchJobDetails();
     }
   }, [jobId, fetchJobDetails]);
 
+  // Update refs when dependencies change
+  useEffect(() => {
+    fetchJobDetailsRef.current = fetchJobDetails;
+  }, [fetchJobDetails]);
+
+  // Monitor status transitions to reset SSE when transitioning to active state
+  useEffect(() => {
+    if (job) {
+      const currentStatus = job.status.toLowerCase();
+      const prevStatus = prevStatusRef.current;
+      const isActive = ['queued', 'instance_creating', 'running'].includes(currentStatus);
+
+      // Case 1: Initial page load with active job (no previous status)
+      if (!prevStatus && isActive && !sseInitialized) {
+        console.log('Job loaded in active state, triggering SSE connection');
+        setSseConnectionTrigger(prev => prev + 1);
+      }
+      // Case 2: Status transitioned from inactive to active
+      else if (prevStatus && !['queued', 'instance_creating', 'running'].includes(prevStatus) && isActive) {
+        console.log('Status transitioned to active, triggering SSE connection');
+        setSseInitialized(false);
+        setSseConnectionTrigger(prev => prev + 1);
+      }
+
+      // Update refs
+      prevStatusRef.current = currentStatus;
+      jobStatusRef.current = currentStatus;
+    }
+  }, [job?.status, sseInitialized]);
+
+  // SSE connection for real-time updates using fetch (supports credentials)
+  useEffect(() => {
+    // Wait for initial job data to load
+    if (!job || sseInitialized) return;
+
+    // Only connect for active jobs
+    const initialStatus = job.status.toLowerCase();
+    if (!['queued', 'instance_creating', 'running'].includes(initialStatus)) {
+      return;
+    }
+
+    // Mark as initialized so we don't reconnect on job state updates
+    setSseInitialized(true);
+
+    let abortController = new AbortController();
+    let shouldContinue = true;
+
+    const connectSSE = async () => {
+      try {
+        // Get auth token for Authorization header
+        const token = localStorage.getItem('access_token');
+        if (!token) {
+          console.error('No access token found');
+          return;
+        }
+
+        // Create SSE URL
+        const baseUrl = typeof window !== 'undefined' && window.location.hostname === 'localhost'
+          ? 'http://localhost:8000'
+          : (typeof window !== 'undefined' ? `${window.location.protocol}//${window.location.host}` : '');
+        const sseUrl = `${baseUrl}/api/v1/events/${jobId}/stream`;
+
+        console.log('Connecting to SSE via fetch:', sseUrl);
+
+        // Use fetch with credentials and Authorization header
+        const response = await fetch(sseUrl, {
+          method: 'GET',
+          headers: {
+            'Accept': 'text/event-stream',
+            'Authorization': `Bearer ${token}`,
+          },
+          credentials: 'include', // Send cookies
+          signal: abortController.signal,
+        });
+
+        if (!response.ok) {
+          throw new Error(`SSE connection failed: ${response.status} ${response.statusText}`);
+        }
+
+        if (!response.body) {
+          throw new Error('Response body is null');
+        }
+
+        console.log('SSE connection established');
+        setSseConnected(true);
+
+        // Read the stream
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        while (shouldContinue) {
+          const { done, value } = await reader.read();
+
+          if (done) {
+            console.log('SSE stream ended');
+            break;
+          }
+
+          // Decode chunk and add to buffer
+          buffer += decoder.decode(value, { stream: true });
+
+          // Process complete events (separated by double newlines)
+          const events = buffer.split('\n\n');
+          buffer = events.pop() || ''; // Keep incomplete event in buffer
+
+          for (const eventText of events) {
+            if (!eventText.trim()) continue;
+
+            // Parse SSE event format
+            const lines = eventText.split('\n');
+            let eventType = 'message';
+            let eventData = '';
+
+            for (const line of lines) {
+              if (line.startsWith('event:')) {
+                eventType = line.substring(6).trim();
+              } else if (line.startsWith('data:')) {
+                eventData = line.substring(5).trim();
+              }
+            }
+
+            if (!eventData) continue;
+
+            try {
+              const data = JSON.parse(eventData);
+
+              // Handle different event types
+              switch (eventType) {
+                case 'job_update':
+                  console.log('Job update received:', data);
+                  setJob((prevJob: any) => prevJob ? {
+                    ...prevJob,
+                    status: data.status,
+                    status_message: data.status_message,
+                    progress: data.progress,
+                    error_message: data.error_message,
+                    time_started: data.time_started,
+                    time_finished: data.time_finished,
+                    actual_cost: data.actual_cost,
+                    estimated_time: data.estimated_time,
+                  } : null);
+                  break;
+
+                case 'log_update':
+                  console.log('Log update received:', data.lines?.length, 'lines');
+                  if (data.lines && data.lines.length > 0) {
+                    if (data.append) {
+                      setLogs((prevLogs: string) => prevLogs + '\n' + data.lines.join('\n'));
+                    } else {
+                      setLogs(data.lines.join('\n'));
+                    }
+                  }
+                  break;
+
+                case 'pot_update':
+                  console.log('Pot file update received:', data.total_cracked, 'passwords cracked');
+                  setCrackedCount(data.total_cracked || 0);
+
+                  if (data.preview && data.preview.length > 0) {
+                    setPotFilePreview({
+                      preview: data.preview.join('\n'),
+                      total_lines_shown: data.preview.length,
+                      truncated: data.truncated || false
+                    });
+                  }
+                  break;
+
+                case 'job_finished':
+                  console.log('Job finished:', data);
+                  setJob((prevJob: any) => prevJob ? {
+                    ...prevJob,
+                    status: data.status,
+                    status_message: data.status_message,
+                    progress: data.progress,
+                    error_message: data.error_message,
+                    time_started: data.time_started,
+                    time_finished: data.time_finished,
+                    actual_cost: data.actual_cost,
+                  } : null);
+                  // Fetch final data asynchronously using ref to avoid dependency
+                  setTimeout(() => {
+                    if (fetchJobDetailsRef.current) {
+                      fetchJobDetailsRef.current();
+                    }
+                  }, 100);
+                  shouldContinue = false;
+                  break;
+
+                case 'error':
+                  console.error('SSE error event:', data);
+                  shouldContinue = false;
+                  break;
+              }
+            } catch (parseError) {
+              console.error('Failed to parse SSE event data:', parseError, eventData);
+            }
+          }
+        }
+
+        setSseConnected(false);
+      } catch (error: any) {
+        console.error('SSE connection error:', error);
+        setSseConnected(false);
+
+        // Don't retry if aborted
+        if (error.name !== 'AbortError') {
+          console.log('SSE will retry connection in 5 seconds...');
+          // Retry connection after delay
+          setTimeout(() => {
+            if (!abortController.signal.aborted) {
+              connectSSE();
+            }
+          }, 5000);
+        }
+      }
+    };
+
+    connectSSE();
+
+    // Cleanup on unmount or when jobId/trigger changes
+    return () => {
+      console.log('Cleaning up SSE connection');
+      shouldContinue = false;
+      abortController.abort();
+      setSseConnected(false);
+    };
+  }, [jobId, sseConnectionTrigger]); // Re-run when jobId or connection trigger changes
+
+  // Auto-scroll to bottom when logs update
+  useEffect(() => {
+    if (autoScroll && logsEndRef.current) {
+      logsEndRef.current.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [logs, autoScroll]);
+
+  // Update display every second for running jobs (elapsed time, current cost)
   useEffect(() => {
     if (job && ['queued', 'instance_creating', 'running'].includes(job.status.toLowerCase())) {
       const interval = setInterval(() => {
-        fetchJobDetails();
-      }, 5000);
-      
+        // Force re-render to update formatDuration and cost calculations
+        setJob((prev: any) => ({ ...prev }));
+      }, 1000);
       return () => clearInterval(interval);
     }
-  }, [job, fetchJobDetails]);
+  }, [job?.status]);
 
   const handleStartJob = async () => {
     setActionLoading(true);
@@ -164,22 +414,33 @@ export default function JobDetailPage() {
   };
 
   const formatDate = (dateString?: string) => {
-    if (!dateString) return 'Not started';
+    if (!dateString) {
+      // Show '-' for running jobs where time_finished is not set yet
+      if (job && ['queued', 'instance_creating', 'running'].includes(job.status.toLowerCase())) {
+        return '-';
+      }
+      return 'Not started';
+    }
     return new Date(dateString).toLocaleString();
   };
 
   const formatDuration = (start?: string, end?: string) => {
     if (!start) return 'N/A';
-    if (!end) return 'In progress';
-    
-    const duration = new Date(end).getTime() - new Date(start).getTime();
-    const minutes = Math.floor(duration / 60000);
+
+    // Calculate elapsed time (use current time if job still running)
+    const startTime = new Date(start).getTime();
+    const endTime = end ? new Date(end).getTime() : Date.now();
+    const duration = endTime - startTime;
+
+    const seconds = Math.floor(duration / 1000);
+    const minutes = Math.floor(seconds / 60);
     const hours = Math.floor(minutes / 60);
-    
-    if (hours > 0) {
-      return `${hours}h ${minutes % 60}m`;
-    }
-    return `${minutes}m`;
+    const days = Math.floor(hours / 24);
+
+    if (days > 0) return `${days}d ${hours % 24}h`;
+    if (hours > 0) return `${hours}h ${minutes % 60}m`;
+    if (minutes > 0) return `${minutes}m ${seconds % 60}s`;
+    return `${seconds}s`;
   };
 
   const getStatusIcon = (status: Job['status']) => {
@@ -406,7 +667,7 @@ export default function JobDetailPage() {
                     <span className="text-slate-400 text-xs font-medium uppercase tracking-wider">Duration</span>
                     <p className="text-slate-200 font-medium">{formatDuration(job.time_started, job.time_finished)}</p>
                   </div>
-                  {job.actual_cost && (
+                  {job.actual_cost && job.actual_cost > 0 && (
                     <div className="space-y-1">
                       <span className="text-slate-400 text-xs font-medium uppercase tracking-wider">Cost</span>
                       <p className="text-emerald-400 font-semibold">${job.actual_cost.toFixed(2)}</p>
@@ -478,9 +739,12 @@ export default function JobDetailPage() {
               <CardTitle className="flex items-center text-slate-200">
                 <Key className="h-5 w-5 mr-2 text-orange-400" />
                 Cracked Passwords
-                {job.cracked_hashes !== undefined && (
-                  <span className="ml-2 text-sm bg-orange-900/30 text-orange-400 border border-orange-500/50 px-2 py-1 rounded-md">
-                    {job.cracked_hashes} found
+                {(crackedCount > 0 || job.cracked_hashes !== undefined) && (
+                  <span className="ml-2 text-sm bg-orange-900/30 text-orange-400 border border-orange-500/50 px-2 py-1 rounded-md flex items-center">
+                    {crackedCount > 0 ? crackedCount : job.cracked_hashes} found
+                    {sseConnected && crackedCount > 0 && (
+                      <span className="ml-2 w-2 h-2 bg-green-400 rounded-full animate-pulse"></span>
+                    )}
                   </span>
                 )}
               </CardTitle>
@@ -564,9 +828,26 @@ export default function JobDetailPage() {
                 <div className="bg-slate-700/50 px-4 py-2 border-b border-slate-600/50">
                   <div className="flex items-center justify-between">
                     <span className="text-xs font-medium text-slate-300 uppercase tracking-wider">Job Execution Output</span>
-                    <div className="flex items-center space-x-2">
-                      <div className="w-2 h-2 bg-green-400 rounded-full animate-pulse"></div>
-                      <span className="text-xs text-slate-400"></span>
+                    <div className="flex items-center space-x-3">
+                      {/* Connection Status */}
+                      {['queued', 'instance_creating', 'running'].includes(job?.status?.toLowerCase() || '') && (
+                        <div className="flex items-center space-x-2">
+                          <div className={`w-2 h-2 rounded-full ${sseConnected ? 'bg-green-400 animate-pulse' : 'bg-red-400'}`}></div>
+                          <span className="text-xs text-slate-400">
+                            {sseConnected ? 'Live' : 'Disconnected'}
+                          </span>
+                        </div>
+                      )}
+                      {/* Auto-scroll Toggle */}
+                      <Button
+                        onClick={() => setAutoScroll(!autoScroll)}
+                        className={`flex items-center space-x-1 px-2 py-1 text-xs ${
+                          autoScroll ? 'bg-blue-600 hover:bg-blue-700' : 'bg-slate-600 hover:bg-slate-700'
+                        }`}
+                      >
+                        <ArrowDown className="h-3 w-3" />
+                        <span>{autoScroll ? 'Auto-scroll On' : 'Auto-scroll Off'}</span>
+                      </Button>
                     </div>
                   </div>
                 </div>
@@ -615,6 +896,8 @@ export default function JobDetailPage() {
                           </div>
                         );
                       }).filter(Boolean)}
+                      {/* Auto-scroll anchor */}
+                      <div ref={logsEndRef} />
                     </div>
                   ) : (
                     <div className="text-center py-8">
