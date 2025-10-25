@@ -118,3 +118,14 @@ temp/
 cache/
 *.tmp
 *.temp
+
+# Serena MCP server
+.serena/
+serena.json
+.serena.json
+
+# Claude Code
+.claude/
+claude.md
+CLAUDE.md
+.claude.json
