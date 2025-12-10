@@ -82,7 +82,7 @@ services:
       - ./frontend:/app
       - /app/node_modules
     environment:
-      NEXT_PUBLIC_API_URL: http://localhost/api
+      NEXT_PUBLIC_API_URL: http://localhost
       NODE_ENV: development
     ports:
       - "3000:3000"

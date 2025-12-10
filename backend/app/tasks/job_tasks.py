@@ -832,23 +832,40 @@ def _execute_job_workflow(job: Job, db: Session) -> Dict[str, Any]:
         # Step 5: Setup instance and transfer files
         job.status_message = "Transferring files and preparing environment..."
         db.commit()
-        final_wordlist_path, rules_paths = _setup_instance(
-            vast_client, instance_id, job, db, ssh_key_path
-        )
+        final_wordlist_path, rules_paths = _setup_instance(vast_client, instance_id, job, db, ssh_key_path)
+        
+        # Step 5.5: Initialize local log file for real-time streaming
+        job_dir = f"/app/data/jobs/{job.id}"
+        os.makedirs(job_dir, exist_ok=True)
+        log_file_path = f"{job_dir}/job.log"
+
+        # Create log file with header
+        with open(log_file_path, 'w') as f:
+            f.write(f"=== VPK Job Log ===\n")
+            f.write(f"Job ID: {job.id}\n")
+            f.write(f"Job Name: {job.name}\n")
+            f.write(f"Started: {datetime.now(timezone.utc).isoformat()}\n")
+            f.write(f"Hash Type: {job.hash_type}\n")
+            f.write(f"{'=' * 50}\n\n")
+
+        # Set log file path on job immediately so SSE can stream it
+        job.log_file_path = log_file_path
+
+        # Initialize pot file for real-time streaming
+        pot_file_path = f"{job_dir}/hashcat.pot"
+        with open(pot_file_path, 'w') as f:
+            f.write(f"# VPK Job {job.id} - Cracked Passwords\n")
+            f.write(f"# Format: hash:plain\n")
+
+        # Set pot file path on job immediately so SSE can stream it
+        job.pot_file_path = pot_file_path
+        db.commit()
 
         # Step 6: Execute hashcat with time limit monitoring
         job.status_message = "Starting password cracking process..."
         db.commit()
-        _execute_hashcat(
-            vast_client,
-            instance_id,
-            job,
-            db,
-            ssh_key_path,
-            final_wordlist_path,
-            rules_paths,
-        )
-
+        _execute_hashcat(vast_client, instance_id, job, db, ssh_key_path, final_wordlist_path, rules_paths, job.log_file_path, job.pot_file_path)
+        
         # Check time limit before retrieving results
         if job.hard_end_time:
             # Ensure hard_end_time is timezone-aware for comparison
@@ -1411,15 +1428,7 @@ def _setup_instance(
     return final_wordlist_path, downloaded_rule_paths
 
 
-def _execute_hashcat(
-    vast_client: VastAIClient,
-    instance_id: int,
-    job: Job,
-    db: Session,
-    ssh_key_path: str = None,
-    wordlist_path: str = None,
-    rules_paths: List[str] = None,
-):
+def _execute_hashcat(vast_client: VastAIClient, instance_id: int, job: Job, db: Session, ssh_key_path: str = None, wordlist_path: str = None, rules_paths: List[str] = None, log_file_path: str = None, pot_file_path: str = None):
     """Execute hashcat on the instance with real-time monitoring"""
     hashcat_service = HashcatService()
 
@@ -1503,20 +1512,10 @@ def _execute_hashcat(
     print(f"Executing hashcat command: {hashcat_cmd}")
 
     # Execute hashcat with real-time monitoring
-    _execute_hashcat_with_monitoring(
-        vast_client, instance_id, job, db, ssh_key_path, hashcat_cmd, timeout_seconds
-    )
+    _execute_hashcat_with_monitoring(vast_client, instance_id, job, db, ssh_key_path, hashcat_cmd, timeout_seconds, log_file_path, pot_file_path)
 
 
-def _execute_hashcat_with_monitoring(
-    vast_client: VastAIClient,
-    instance_id: int,
-    job: Job,
-    db: Session,
-    ssh_key_path: str,
-    hashcat_cmd: str,
-    timeout_seconds: int,
-):
+def _execute_hashcat_with_monitoring(vast_client: VastAIClient, instance_id: int, job: Job, db: Session, ssh_key_path: str, hashcat_cmd: str, timeout_seconds: int, log_file_path: str = None, pot_file_path: str = None):
     """Execute hashcat in background and monitor progress in real-time"""
 
     # Create a wrapper script that properly detaches the process
@@ -1582,7 +1581,7 @@ exit 0
 
     # Monitor progress in real-time
     monitoring_start_time = datetime.now(timezone.utc)
-    last_log_size = 0
+    last_log_position = 0  # Track bytes written to local log file
     consecutive_failures = 0
     max_consecutive_failures = 5
     monitoring_loops = 0
@@ -1670,6 +1669,67 @@ exit 0
                     # Parse progress from the latest output
                     _parse_hashcat_progress_realtime(output, job, db)
 
+                    # Write new log content to local file for real-time streaming
+                    if log_file_path:
+                        try:
+                            # Get current size of remote log file
+                            size_cmd = "wc -c < /workspace/hashcat_output.log 2>/dev/null || echo '0'"
+                            size_result = asyncio.run(vast_client.execute_command(instance_id, size_cmd, ssh_key_path))
+                            current_size = int(size_result.get('stdout', '0').strip())
+
+                            # If there's new content, fetch and append it
+                            if current_size > last_log_position:
+                                # Read from last position to end
+                                read_cmd = f"tail -c +{last_log_position + 1} /workspace/hashcat_output.log 2>/dev/null"
+                                new_content_result = asyncio.run(vast_client.execute_command(instance_id, read_cmd, ssh_key_path))
+
+                                if new_content_result.get('returncode') == 0:
+                                    new_content = new_content_result.get('stdout', '')
+                                    if new_content:
+                                        # Append to local log file
+                                        with open(log_file_path, 'a') as log_f:
+                                            log_f.write(new_content)
+                                        last_log_position = current_size
+                                        print(f"DEBUG: Wrote {len(new_content)} bytes to local log (position: {last_log_position})")
+                        except Exception as log_error:
+                            print(f"DEBUG: Failed to write log content: {log_error}")
+
+                    # Download pot file incrementally (cracked passwords)
+                    if pot_file_path:
+                        try:
+                            # Try primary pot file locations
+                            pot_locations = [
+                                "/dev/shm/hashcat_secure/hashcat.pot",
+                                "/dev/shm/hashcat_secure/cracked.txt"
+                            ]
+
+                            for pot_location in pot_locations:
+                                # Check if file exists and get size
+                                check_cmd = f"test -f {pot_location} && wc -c < {pot_location} 2>/dev/null || echo '0'"
+                                check_result = asyncio.run(vast_client.execute_command(instance_id, check_cmd, ssh_key_path))
+
+                                if check_result.get('returncode') == 0:
+                                    remote_pot_size = int(check_result.get('stdout', '0').strip())
+
+                                    if remote_pot_size > 0:
+                                        # Download pot file content
+                                        cat_cmd = f"cat {pot_location} 2>/dev/null"
+                                        pot_result = asyncio.run(vast_client.execute_command(instance_id, cat_cmd, ssh_key_path))
+
+                                        if pot_result.get('returncode') == 0:
+                                            pot_content = pot_result.get('stdout', '')
+                                            if pot_content:
+                                                # Overwrite local pot file (hashcat appends, we want full content)
+                                                with open(pot_file_path, 'w') as pot_f:
+                                                    # Write header
+                                                    pot_f.write(f"# VPK Job {job.id} - Cracked Passwords\n")
+                                                    pot_f.write(f"# Format: hash:plain\n")
+                                                    pot_f.write(pot_content)
+                                                print(f"DEBUG: Updated pot file with {len(pot_content)} bytes ({len(pot_content.splitlines())} lines)")
+                                                break  # Found and downloaded, stop trying other locations
+                        except Exception as pot_error:
+                            print(f"DEBUG: Failed to download pot file: {pot_error}")
+
                     # Reset failure counter on successful read
                     consecutive_failures = 0
                 else:
@@ -1707,6 +1767,22 @@ exit 0
                     if final_output and final_output != "No final output":
                         print(f"DEBUG: Final output ({len(final_output)} chars)")
                         _parse_hashcat_progress_realtime(final_output, job, db)
+
+                        # Write final log content to local file
+                        if log_file_path:
+                            try:
+                                # Get any remaining content not yet written
+                                current_size = len(final_output.encode('utf-8'))
+                                if current_size > last_log_position:
+                                    # Since we have the full content, just write what's new
+                                    remaining_content = final_output[last_log_position:]
+                                    if remaining_content:
+                                        with open(log_file_path, 'a') as log_f:
+                                            log_f.write(remaining_content)
+                                            log_f.write("\n\n=== Job completed ===\n")
+                                        print(f"DEBUG: Wrote final {len(remaining_content)} bytes to local log")
+                            except Exception as log_error:
+                                print(f"DEBUG: Failed to write final log content: {log_error}")
                     else:
                         print("DEBUG: No final output available")
                         # Set completion status

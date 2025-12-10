@@ -1194,11 +1194,11 @@ function TimingCostStep({ formData, updateFormData, estimatedCost }: any) {
     updateFormData({ hard_end_time: endTime });
   }, [updateFormData]);
 
+  // Initialize end time on mount
   useEffect(() => {
-    const totalHours = days * 24 + hours + minutes / 60;
-    const endTime = new Date(Date.now() + totalHours * 60 * 60 * 1000);
-    updateFormData({ hard_end_time: endTime });
-  }, [minutes, hours, days, updateFormData]);
+    updateEndTime(minutes, hours, days);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // Only run once on mount
 
   useEffect(() => {
     const fetchEstimate = async () => {
