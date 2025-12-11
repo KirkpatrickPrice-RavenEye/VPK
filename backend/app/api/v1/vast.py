@@ -6,6 +6,22 @@ from app.core.config import settings
 
 router = APIRouter()
 
+# Location filter mappings - maps region codes to country codes
+LOCATION_MAPPINGS = {
+    "US": ["US"],
+    "CA": ["CA"],
+    "EU": [
+        "DE", "FR", "NL", "GB", "SE", "NO", "FI", "IT", "ES", "AT",
+        "BE", "DK", "IE", "PT", "CH", "PL", "CZ", "HU", "RO", "BG",
+        "HR", "SI", "SK", "EE", "LV", "LT", "LU", "MT", "CY", "IS",
+        "GR", "RS", "BA", "ME", "MK", "AL", "XK", "MD", "UA", "BY"
+    ],
+    "AS": [
+        "JP", "KR", "CN", "SG", "HK", "IN", "TW", "TH", "MY", "ID", 
+        "PH", "VN", "KH", "MM", "LA", "BN", "NP", "BD", "LK", "PK"
+    ]
+}
+
 
 @router.get("/test-connection")
 async def test_vast_connection(
@@ -137,8 +153,14 @@ async def get_offers_for_job(
         # Filter by location
         if location_filter:
             location_filter_upper = location_filter.upper()
-            filtered_offers = [offer for offer in filtered_offers 
-                             if offer["geolocation"] == location_filter_upper]
+            # Get list of allowed country codes for this filter
+            allowed_countries = LOCATION_MAPPINGS.get(location_filter_upper, [location_filter_upper])
+            
+            # Extract country code from geolocation string (format: "Location, CODE" or ", CODE")
+            filtered_offers = [
+                offer for offer in filtered_offers 
+                if offer["geolocation"].split(", ")[-1] in allowed_countries
+            ]
         
         # Filter by minimum disk space
         if min_disk_space_gb > 0:
