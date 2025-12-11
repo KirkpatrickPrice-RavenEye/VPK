@@ -20,14 +20,25 @@ class S3Client:
         #if not all([aws_access_key, aws_secret_key, bucket_name]):
         #   raise ValueError("AWS credentials and S3 bucket name must be configured in application settings")
         
-        self.s3_client = boto3.client(
-            's3',
-            aws_access_key_id=aws_access_key,
-            aws_secret_access_key=aws_secret_key,
-            region_name=settings_service.s3_region,
-            # testing this, may be required for signed url
-            config=Config(signature_version='s3v4'),
-        )
+        # Support both explicit credentials and IAM roles
+        # When credentials are None, omit them entirely so boto3 uses its credential chain (IAM roles, env vars, etc)
+        if aws_access_key and aws_secret_key:
+            # Use explicit credentials
+            self.s3_client = boto3.client(
+                's3',
+                aws_access_key_id=aws_access_key,
+                aws_secret_access_key=aws_secret_key,
+                region_name=settings_service.s3_region,
+                config=Config(signature_version='s3v4'),
+            )
+        else:
+            # Use IAM role or other credential chain methods
+            # Do NOT pass aws_access_key_id/aws_secret_access_key parameters at all
+            self.s3_client = boto3.client(
+                's3',
+                region_name=settings_service.s3_region,
+                config=Config(signature_version='s3v4'),
+            )
         self.bucket_name = bucket_name
     
     def _count_rules_in_file(self, file_obj: BinaryIO) -> int:

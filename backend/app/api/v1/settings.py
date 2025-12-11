@@ -130,12 +130,21 @@ def test_aws_connection(
         from botocore.exceptions import ClientError
         
         # Test S3 connection
-        s3_client = boto3.client(
-            's3',
-            aws_access_key_id=settings.aws_access_key_id,
-            aws_secret_access_key=settings.aws_secret_access_key,
-            region_name=settings.s3_region
-        )
+        # Support both explicit credentials and IAM roles
+        if settings.aws_access_key_id and settings.aws_secret_access_key:
+            # Use explicit credentials
+            s3_client = boto3.client(
+                's3',
+                aws_access_key_id=settings.aws_access_key_id,
+                aws_secret_access_key=settings.aws_secret_access_key,
+                region_name=settings.s3_region
+            )
+        else:
+            # Use IAM role or other credential chain methods
+            s3_client = boto3.client(
+                's3',
+                region_name=settings.s3_region
+            )
         
         # Try to list objects in the bucket
         if settings.s3_bucket_name:
