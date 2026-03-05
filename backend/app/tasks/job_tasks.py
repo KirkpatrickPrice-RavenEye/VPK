@@ -853,11 +853,21 @@ def _execute_job_workflow(job: Job, db: Session) -> Dict[str, Any]:
         # Set log file path on job immediately so SSE can stream it
         job.log_file_path = log_file_path
 
-        # Initialize pot file for real-time streaming
+        # Initialize pot file for real-time streaming (atomic write)
         pot_file_path = f"{job_dir}/hashcat.pot"
-        with open(pot_file_path, "w") as f:
+        import tempfile
+
+        tmp_fd, tmp_path = tempfile.mkstemp(
+            dir=os.path.dirname(pot_file_path),
+            prefix=".pot_init_",
+            suffix=".pot",
+        )
+        with os.fdopen(tmp_fd, "w") as f:
             f.write(f"# VPK Job {job.id} - Cracked Passwords\n")
             f.write(f"# Format: hash:plain\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, pot_file_path)
 
         # Set pot file path on job immediately so SSE can stream it
         job.pot_file_path = pot_file_path
@@ -1816,16 +1826,38 @@ exit 0
                                         if pot_result.get("returncode") == 0:
                                             pot_content = pot_result.get("stdout", "")
                                             if pot_content:
-                                                # Overwrite local pot file (hashcat appends, we want full content)
-                                                with open(pot_file_path, "w") as pot_f:
-                                                    # Write header
-                                                    pot_f.write(
-                                                        f"# VPK Job {job.id} - Cracked Passwords\n"
-                                                    )
-                                                    pot_f.write(
-                                                        f"# Format: hash:plain\n"
-                                                    )
-                                                    pot_f.write(pot_content)
+                                                # Atomically overwrite local pot file to avoid
+                                                # race with SSE reader seeing a truncated file.
+                                                # Write to a temp file first, then os.replace()
+                                                # which is atomic on POSIX.
+                                                import tempfile
+
+                                                tmp_fd, tmp_path = tempfile.mkstemp(
+                                                    dir=os.path.dirname(pot_file_path),
+                                                    prefix=".pot_tmp_",
+                                                    suffix=".pot",
+                                                )
+                                                try:
+                                                    with os.fdopen(
+                                                        tmp_fd, "w"
+                                                    ) as pot_f:
+                                                        pot_f.write(
+                                                            f"# VPK Job {job.id} - Cracked Passwords\n"
+                                                        )
+                                                        pot_f.write(
+                                                            f"# Format: hash:plain\n"
+                                                        )
+                                                        pot_f.write(pot_content)
+                                                        pot_f.flush()
+                                                        os.fsync(pot_f.fileno())
+                                                    os.replace(tmp_path, pot_file_path)
+                                                except Exception:
+                                                    # Clean up temp file on failure
+                                                    try:
+                                                        os.unlink(tmp_path)
+                                                    except OSError:
+                                                        pass
+                                                    raise
                                                 print(
                                                     f"DEBUG: Updated pot file with {len(pot_content)} bytes ({len(pot_content.splitlines())} lines)"
                                                 )
@@ -2427,7 +2459,7 @@ def _retrieve_results(
                 "-o",
                 "UserKnownHostsFile=/dev/null",
                 f"{user}@{host}:{pot_location}",
-                pot_file_path,
+                pot_file_path + ".tmp",
             ]
 
             result = subprocess.run(copy_cmd, capture_output=True, text=True)
@@ -2435,18 +2467,22 @@ def _retrieve_results(
                 f"DEBUG: Pot copy from {pot_location} - return code: {result.returncode}"
             )
             print(f"DEBUG: Pot copy stderr: {result.stderr}")
+
+            tmp_scp_path = pot_file_path + ".tmp"
             print(
-                f"DEBUG: Local file exists after copy: {os.path.exists(pot_file_path)}"
+                f"DEBUG: Local file exists after copy: {os.path.exists(tmp_scp_path)}"
             )
-            print(f"DEBUG: Local file is file: {os.path.isfile(pot_file_path)}")
+            print(f"DEBUG: Local file is file: {os.path.isfile(tmp_scp_path)}")
 
             # Check file size for debugging
             file_size = (
-                os.path.getsize(pot_file_path) if os.path.exists(pot_file_path) else -1
+                os.path.getsize(tmp_scp_path) if os.path.exists(tmp_scp_path) else -1
             )
             print(f"DEBUG: Local file size: {file_size} bytes")
 
-            if result.returncode == 0 and os.path.isfile(pot_file_path):
+            if result.returncode == 0 and os.path.isfile(tmp_scp_path):
+                # Atomically replace pot file so SSE reader never sees a partial file
+                os.replace(tmp_scp_path, pot_file_path)
                 job.pot_file_path = pot_file_path
                 if file_size == 0:
                     print(
@@ -2457,17 +2493,17 @@ def _retrieve_results(
                         f"Successfully retrieved pot file from {pot_location} ({file_size} bytes)"
                     )
                 break
-            elif os.path.exists(pot_file_path):
+            elif os.path.exists(tmp_scp_path):
                 print(
                     f"DEBUG: Copy created something but it's not a valid file (size: {file_size})"
                 )
                 # Clean up if something was created but it's not a proper file
-                if os.path.isdir(pot_file_path):
+                if os.path.isdir(tmp_scp_path):
                     import shutil
 
-                    shutil.rmtree(pot_file_path)
+                    shutil.rmtree(tmp_scp_path)
                 else:
-                    os.remove(pot_file_path)
+                    os.remove(tmp_scp_path)
         except Exception as e:
             print(f"Failed to retrieve pot file from {pot_location}: {e}")
 
@@ -2821,6 +2857,9 @@ def _retrieve_results_fast(
                 print(f"Found pot file at {pot_location}, copying...")
 
                 # Use SCP to copy the file (15 seconds per location)
+                # SCP to a temp file first, then atomically rename to avoid
+                # the SSE reader seeing a truncated/partial pot file.
+                tmp_scp_path = pot_file_path + ".tmp"
                 scp_cmd = [
                     "scp",
                     "-i",
@@ -2834,13 +2873,14 @@ def _retrieve_results_fast(
                     "-o",
                     "ConnectTimeout=10",
                     f"{user}@{host}:{pot_location}",
-                    pot_file_path,
+                    tmp_scp_path,
                 ]
 
                 result = subprocess.run(
                     scp_cmd, capture_output=True, text=True, timeout=15.0
                 )
-                if result.returncode == 0 and os.path.isfile(pot_file_path):
+                if result.returncode == 0 and os.path.isfile(tmp_scp_path):
+                    os.replace(tmp_scp_path, pot_file_path)
                     job.pot_file_path = pot_file_path
                     file_size = os.path.getsize(pot_file_path)
                     if file_size == 0:
@@ -2854,6 +2894,12 @@ def _retrieve_results_fast(
                     pot_retrieved = True
                     break
                 else:
+                    # Clean up failed temp file
+                    if os.path.exists(tmp_scp_path):
+                        try:
+                            os.remove(tmp_scp_path)
+                        except OSError:
+                            pass
                     print(f"SCP failed for {pot_location}: {result.stderr}")
             else:
                 print(f"Pot file not found at {pot_location}")

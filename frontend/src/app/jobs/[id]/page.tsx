@@ -271,13 +271,27 @@ export default function JobDetailPage() {
 
                 case 'pot_update':
                   console.log('Pot file update received:', data.total_cracked, 'passwords cracked');
-                  setCrackedCount(data.total_cracked || 0);
+                  // Cracked count is monotonically increasing during a job.
+                  // Never decrease it - a lower value means we read a
+                  // truncated pot file on the backend.
+                  setCrackedCount(prev => Math.max(prev, data.total_cracked || 0));
 
+                  // Only update preview if the new data actually has content.
+                  // Avoid clobbering a valid preview with an empty one from a
+                  // transient file read.
                   if (data.preview && data.preview.length > 0) {
-                    setPotFilePreview({
-                      preview: data.preview.join('\n'),
-                      total_lines_shown: data.preview.length,
-                      truncated: data.truncated || false
+                    setPotFilePreview(prev => {
+                      const newCount = data.preview.length;
+                      const oldCount = prev?.total_lines_shown ?? 0;
+                      // Accept update if it has at least as many results
+                      if (newCount >= oldCount) {
+                        return {
+                          preview: data.preview.join('\n'),
+                          total_lines_shown: data.preview.length,
+                          truncated: data.truncated || false
+                        };
+                      }
+                      return prev;
                     });
                   }
                   break;
