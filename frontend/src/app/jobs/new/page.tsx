@@ -13,6 +13,8 @@ import { Button } from '@/components/ui/Button';
 import { Input } from '@/components/ui/Input';
 import { Badge } from '@/components/ui/badge';
 import { Alert, AlertDescription } from '@/components/ui/Alert';
+import { HashTypeCombobox } from '@/components/ui/HashTypeCombobox';
+import { getHashTypeByMode } from '@/data/hashTypes';
 import { 
   ChevronLeft, 
   ChevronRight, 
@@ -78,95 +80,7 @@ const WIZARD_STEPS: WizardStep[] = [
   }
 ];
 
-const HASH_TYPES = [
-  // Basic Hash Types
-  { value: 'md5', label: '0 - MD5', mode: '0' },
-  { value: 'sha1', label: '100 - SHA1', mode: '100' },
-  { value: 'md4', label: '900 - MD4', mode: '900' },
-  { value: 'sha224', label: '1300 - SHA224', mode: '1300' },
-  { value: 'sha256', label: '1400 - SHA256', mode: '1400' },
-  { value: 'sha512', label: '1700 - SHA512', mode: '1700' },
-  { value: 'sha384', label: '10800 - SHA384', mode: '10800' },
-  { value: 'sha3-224', label: '17300 - SHA3-224', mode: '17300' },
-  { value: 'sha3-256', label: '17400 - SHA3-256', mode: '17400' },
-  { value: 'sha3-384', label: '17500 - SHA3-384', mode: '17500' },
-  { value: 'sha3-512', label: '17600 - SHA3-512', mode: '17600' },
-  
-  // Windows/NTLM Types  
-  { value: 'ntlm', label: '1000 - NTLM', mode: '1000' },
-  { value: 'domain-cached', label: '1100 - Domain Cached Credentials (DCC)', mode: '1100' },
-  { value: 'domain-cached2', label: '2100 - Domain Cached Credentials 2 (DCC2)', mode: '2100' },
-  { value: 'lm', label: '3000 - LM Hash', mode: '3000' },
-  { value: 'net-ntlmv1', label: '5500 - NetNTLMv1 / NetNTLMv1+ESS', mode: '5500' },
-  { value: 'net-ntlmv2', label: '5600 - NetNTLMv2', mode: '5600' },
-  
-  // Kerberos Types
-  { value: 'krb5pa-etype23', label: '7500 - Kerberos 5 AS-REQ Pre-Auth etype 23', mode: '7500' },
-  { value: 'krb5tgs-etype23', label: '13100 - Kerberos 5 TGS-REP etype 23', mode: '13100' },
-  { value: 'krb5asrep', label: '18200 - Kerberos 5 AS-REP etype 23 (Kerberoasting)', mode: '18200' },
-  { value: 'krb5pa-etype17', label: '19600 - Kerberos 5 AS-REQ Pre-Auth etype 17', mode: '19600' },
-  { value: 'krb5pa-etype18', label: '19700 - Kerberos 5 AS-REQ Pre-Auth etype 18', mode: '19700' },
-  
-  // Linux/Unix Types
-  { value: 'md5-crypt', label: '500 - md5crypt, MD5 (Unix)', mode: '500' },
-  { value: 'des-crypt', label: '1500 - DES(Unix)', mode: '1500' },
-  { value: 'sha512-crypt', label: '1800 - sha512crypt $6$, SHA512 (Unix)', mode: '1800' },
-  { value: 'bcrypt', label: '3200 - bcrypt $2*$, Blowfish (Unix)', mode: '3200' },
-  { value: 'sha256-crypt', label: '7400 - sha256crypt $5$, SHA256 (Unix)', mode: '7400' },
-  { value: 'scrypt', label: '8900 - scrypt', mode: '8900' },
-  { value: 'argon2', label: '25700 - Argon2', mode: '25700' },
-  
-  // Database Types
-  { value: 'postgresql-md5', label: '11 - PostgreSQL MD5', mode: '11' },
-  { value: 'postgresql', label: '12 - PostgreSQL', mode: '12' },
-  { value: 'oracle-s', label: '112 - Oracle S: Type (Oracle 11+)', mode: '112' },
-  { value: 'mssql2000', label: '131 - MSSQL(2000)', mode: '131' },
-  { value: 'mssql2005', label: '132 - MSSQL(2005)', mode: '132' },
-  { value: 'mysql323', label: '200 - MySQL323', mode: '200' },
-  { value: 'mysql41', label: '300 - MySQL4.1/MySQL5', mode: '300' },
-  { value: 'mssql2012', label: '1731 - MSSQL(2012, 2014)', mode: '1731' },
-  { value: 'oracle-h', label: '3100 - Oracle H: Type (Oracle 7+)', mode: '3100' },
-  { value: 'oracle-t', label: '12300 - Oracle T: Type (Oracle 12+)', mode: '12300' },
-  { value: 'postgresql-scram-sha-256', label: '28600 - PostgreSQL SCRAM-SHA-256', mode: '28600' },
-  
-  // Application Types
-  { value: 'joomla', label: '11 - Joomla < 2.5.18', mode: '11' },
-  { value: 'oscommerce', label: '21 - osCommerce, xt:Commerce MD5', mode: '21' },
-  { value: 'phpass', label: '400 - phpass (WordPress, phpBB3, etc.)', mode: '400' },
-  { value: 'django-sha1', label: '1900 - Django (SHA1)', mode: '1900' },
-  { value: 'mediawiki', label: '3711 - MediaWiki B type', mode: '3711' },
-  { value: 'drupal7', label: '7900 - Drupal7', mode: '7900' },
-  { value: 'atlassian', label: '12001 - Atlassian (PBKDF2-HMAC-SHA1)', mode: '12001' },
-  
-  // Archive/Document Types
-  { value: 'office2007', label: '9400 - MS Office 2007', mode: '9400' },
-  { value: 'office2010', label: '9500 - MS Office 2010', mode: '9500' },
-  { value: 'office2013', label: '9600 - MS Office 2013', mode: '9600' },
-  { value: 'pdf', label: '10400 - PDF 1.1 - 1.3 (Acrobat 2 - 4)', mode: '10400' },
-  { value: '7zip', label: '11600 - 7-Zip', mode: '11600' },
-  { value: 'rar3', label: '12500 - RAR3-hp', mode: '12500' },
-  { value: 'rar5', label: '13000 - RAR5', mode: '13000' },
-  { value: 'zip', label: '13600 - WinZip', mode: '13600' },
-  
-  // WiFi/Network Types
-  { value: 'wep', label: '1 - WEP', mode: '1' },
-  { value: 'cisco-pix', label: '2400 - Cisco-PIX MD5', mode: '2400' },
-  { value: 'wpa-legacy', label: '2500 - WPA/WPA2 (Legacy)', mode: '2500' },
-  { value: 'wpa-pmk', label: '16800 - WPA-PMKID-PMK', mode: '16800' },
-  { value: 'wpa-pmkid', label: '22000 - WPA-PBKDF2-PMKID+EAPOL', mode: '22000' },
-  
-  // Other Common Types
-  { value: 'lastpass', label: '6800 - LastPass', mode: '6800' },
-  { value: 'pbkdf2-sha256', label: '10900 - PBKDF2-HMAC-SHA256', mode: '10900' },
-  { value: 'bitcoin', label: '11300 - Bitcoin/Litecoin wallet.dat', mode: '11300' },
-  { value: 'pbkdf2-sha1', label: '12000 - PBKDF2-HMAC-SHA1', mode: '12000' },
-  { value: 'pbkdf2-sha512', label: '12100 - PBKDF2-HMAC-SHA512', mode: '12100' },
-  { value: 'keepass', label: '13400 - KeePass 1 (AES/Twofish) and KeePass 2 (AES)', mode: '13400' },
-  { value: 'veracrypt', label: '13711 - VeraCrypt', mode: '13711' },
-  { value: 'luks', label: '14600 - LUKS', mode: '14600' },
-  { value: 'ethereum', label: '15700 - Ethereum Wallet, PBKDF2-HMAC-SHA256', mode: '15700' },
-  { value: 'keychain', label: '23100 - Mac OS X Keychain', mode: '23100' }
-];
+
 
 // Helper function to format storage values in human-readable format
 const formatStorage = (sizeGB: number): string => {
@@ -185,7 +99,7 @@ export default function NewJobPage() {
   const [currentStep, setCurrentStep] = useState(0);
   const [formData, setFormData] = useState<JobFormData>({
     name: '',
-    hash_type: 'md5'
+    hash_type: '0'
   });
   
   // Data for dropdowns
@@ -338,9 +252,8 @@ export default function NewJobPage() {
 
     try {
       // Create the job
-      // Find the hash type details to get the mode number
-      const selectedHashType = HASH_TYPES.find(type => type.value === formData.hash_type);
-      
+      // formData.hash_type is already the mode number (e.g. "0", "1000")
+
       // Calculate required disk space (same logic as instance selection)
       let requiredDiskGB = 20; // Base minimum for OS and tools
       if (formData.word_list && wordlists.length > 0) {
@@ -374,7 +287,7 @@ export default function NewJobPage() {
       
       const jobData: JobCreateRequest = {
         name: formData.name,
-        hash_type: selectedHashType?.mode || formData.hash_type, // Send mode number instead of hash type name
+        hash_type: formData.hash_type, // mode number string sent directly to backend
         word_list: formData.word_list,
         rule_files: formData.rule_files,
         custom_attack: formData.custom_attack,
@@ -632,17 +545,11 @@ function BasicDetailsStep({ formData, updateFormData }: any) {
       
       <div>
         <label className="block text-sm font-medium mb-2 text-slate-300">Hash Type</label>
-        <select 
-          value={formData.hash_type} 
-          onChange={(e) => updateFormData({ hash_type: e.target.value })}
-          className="flex h-10 w-full rounded-lg border bg-slate-800/50 border-slate-600/50 text-slate-200 px-3 py-2 text-sm focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/20 disabled:cursor-not-allowed disabled:opacity-50"
-        >
-          {HASH_TYPES.map(type => (
-            <option key={type.value} value={type.value}>
-              {type.label} (Mode {type.mode})
-            </option>
-          ))}
-        </select>
+        <HashTypeCombobox
+          value={formData.hash_type}
+          onChange={(mode) => updateFormData({ hash_type: mode })}
+          className="w-full"
+        />
       </div>
     </div>
   );
@@ -1202,18 +1109,15 @@ function TimingCostStep({ formData, updateFormData, estimatedCost }: any) {
 
   useEffect(() => {
     const fetchEstimate = async () => {
+      // formData.hash_type is already the mode number
       if (!formData.selected_offer || !formData.hash_count || !formData.hash_type) {
         return;
       }
 
-      // Find the hash type mode
-      const selectedHashType = HASH_TYPES.find(type => type.value === formData.hash_type);
-      if (!selectedHashType) return;
-
       setLoadingEstimate(true);
       try {
         const estimate = await jobApi.estimateTime({
-          hash_mode: selectedHashType.mode,
+          hash_mode: formData.hash_type,
           gpu_model: formData.selected_offer.gpu_name,
           num_gpus: formData.selected_offer.num_gpus,
           num_hashes: formData.hash_count,
@@ -1447,7 +1351,7 @@ function ReviewSubmitStep({ formData, estimatedCost }: any) {
           <h3 className="font-medium mb-3">Job Configuration</h3>
           <div className="space-y-2 text-sm">
             <div><strong>Name:</strong> {formData.name}</div>
-            <div><strong>Hash Type:</strong> {formData.hash_type.toUpperCase()}</div>
+            <div><strong>Hash Type:</strong> {getHashTypeByMode(formData.hash_type)?.name ?? formData.hash_type} <span className="text-slate-500 font-mono text-xs">(mode {formData.hash_type})</span></div>
             <div><strong>Hash File:</strong> {formData.hash_file?.name}</div>
             {formData.word_list && <div><strong>Wordlist:</strong> {formData.word_list}</div>}
             {formData.rule_files && formData.rule_files.length > 0 && (
