@@ -307,6 +307,7 @@ export interface Settings {
   vast_cloud_connection_id?: string;
   aws_configured: boolean;
   vast_configured: boolean;
+  teams_webhook_configured: boolean;
   created_at?: string;
   updated_at?: string;
 }
@@ -323,6 +324,7 @@ export interface SettingsUpdate {
   aws_access_key_id?: string;
   aws_secret_access_key?: string;
   vast_api_key?: string;
+  teams_webhook_url?: string;
 }
 
 export interface ConnectionTestResponse {
@@ -349,6 +351,11 @@ export const settingsApi = {
 
   testVastConnection: async (): Promise<ConnectionTestResponse> => {
     const response = await api.post('/settings/test-vast');
+    return response.data;
+  },
+
+  testTeamsConnection: async (): Promise<ConnectionTestResponse> => {
+    const response = await api.post('/settings/test-teams');
     return response.data;
   },
 };

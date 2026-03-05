@@ -25,7 +25,8 @@ import {
   AlertTriangle,
   XCircle,
   Database,
-  RefreshCw
+  RefreshCw,
+  Bell
 } from 'lucide-react';
 
 export default function SettingsPage() {
@@ -36,7 +37,7 @@ export default function SettingsPage() {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
-  const [testResults, setTestResults] = useState<{aws?: any; vast?: any}>({});
+  const [testResults, setTestResults] = useState<{aws?: any; vast?: any; teams?: any}>({});
   const [populatingCatalog, setPopulatingCatalog] = useState(false);
   const [catalogResult, setCatalogResult] = useState<{detail: string, total_entries: number, pages_scraped: number} | null>(null);
 
@@ -89,11 +90,12 @@ export default function SettingsPage() {
     }
   };
 
-  const testConnection = async (type: 'aws' | 'vast') => {
+  const testConnection = async (type: 'aws' | 'vast' | 'teams') => {
     try {
-      const result = type === 'aws' 
-        ? await settingsApi.testAwsConnection()
-        : await settingsApi.testVastConnection();
+      let result;
+      if (type === 'aws') result = await settingsApi.testAwsConnection();
+      else if (type === 'vast') result = await settingsApi.testVastConnection();
+      else result = await settingsApi.testTeamsConnection();
       
       setTestResults(prev => ({ ...prev, [type]: result }));
     } catch (err: any) {
@@ -378,8 +380,46 @@ export default function SettingsPage() {
             </CardContent>
           </Card>
 
-          {/* Wordlist Catalog Management */}
+          {/* Notifications */}
           <Card className="bg-white/5 border border-slate-700/60 rounded-lg shadow-lg backdrop-blur-sm">
+            <CardHeader className="border-b border-slate-700/50">
+              <CardTitle className="flex items-center text-slate-200">
+                <Bell className="h-5 w-5 mr-2 text-blue-400" />
+                Notifications
+                {settings?.teams_webhook_configured && <CheckCircle className="h-4 w-4 ml-2 text-emerald-400" />}
+              </CardTitle>
+              <CardDescription className="text-slate-400">Configure Microsoft Teams notifications for job completion and failures</CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-4 pt-6">
+              <div className="grid grid-cols-1 gap-4">
+                <div>
+                  <label className="block text-sm font-medium mb-2 text-slate-300">Teams Webhook URL</label>
+                  <Input
+                    type="password"
+                    value={formData.teams_webhook_url || ''}
+                    onChange={(e) => setFormData({ ...formData, teams_webhook_url: e.target.value })}
+                    placeholder={settings?.teams_webhook_configured ? '••••••••••••' : 'https://outlook.office.com/webhook/...'}
+                    className="bg-slate-800/50 border-slate-600/50 text-slate-200 placeholder:text-slate-500 focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/20"
+                  />
+                </div>
+              </div>
+
+              <div className="flex items-center space-x-2">
+                <Button type="button" variant="outline" onClick={() => testConnection('teams')} className="border-blue-500/50 text-blue-400 hover:bg-blue-900/20 hover:text-blue-300 hover:border-blue-400 bg-transparent rounded-lg font-medium shadow-sm transition-all duration-200">
+                  <TestTube className="h-4 w-4 mr-2" />
+                  Test Teams Webhook
+                </Button>
+                {testResults.teams && (
+                  <div className="flex items-center space-x-2">
+                    {getTestIcon(testResults.teams)}
+                    <span className="text-sm text-slate-300">{testResults.teams.message}</span>
+                  </div>
+                )}
+              </div>
+            </CardContent>
+          </Card>
+
+          {/* Wordlist Catalog Management */}          <Card className="bg-white/5 border border-slate-700/60 rounded-lg shadow-lg backdrop-blur-sm">
             <CardHeader className="border-b border-slate-700/50">
               <CardTitle className="flex items-center text-slate-200">
                 <Database className="h-5 w-5 mr-2 text-cyan-400" />

@@ -17,6 +17,7 @@ from app.services.vast_client import VastAIClient
 from app.services.s3_client import S3Client
 from app.services.hashcat_service import HashcatService
 from app.services.settings_service import get_settings_service
+from app.services.notification_service import send_job_notification
 
 # Get Celery task logger
 logger = get_task_logger(__name__)
@@ -985,6 +986,22 @@ def _execute_job_workflow(job: Job, db: Session) -> Dict[str, Any]:
 
         db.commit()
 
+        # Send Teams notification (non-blocking – errors are logged, not raised)
+        try:
+            webhook_url = settings_service.get_teams_webhook_url()
+            if webhook_url:
+                # Refresh user relationship to get email
+                db.refresh(job)
+                user = job.user
+                if user:
+                    send_job_notification(job, user.email, webhook_url)
+                else:
+                    logger.warning(
+                        f"Could not load user for job {job.id} – skipping Teams notification"
+                    )
+        except Exception as notify_exc:
+            logger.warning(f"Teams notification failed for job {job.id}: {notify_exc}")
+
         return {
             "status": "completed",
             "instance_id": instance_id,
@@ -999,6 +1016,24 @@ def _execute_job_workflow(job: Job, db: Session) -> Dict[str, Any]:
         job.error_message = str(e)
         job.time_finished = datetime.now(timezone.utc)
         db.commit()
+
+        # Send Teams failure notification (non-blocking)
+        try:
+            webhook_url = settings_service.get_teams_webhook_url()
+            if webhook_url:
+                db.refresh(job)
+                user = job.user
+                if user:
+                    send_job_notification(job, user.email, webhook_url)
+                else:
+                    logger.warning(
+                        f"Could not load user for job {job.id} – skipping Teams failure notification"
+                    )
+        except Exception as notify_exc:
+            logger.warning(
+                f"Teams failure notification failed for job {job.id}: {notify_exc}"
+            )
+
         raise e
 
     finally:
@@ -1358,7 +1393,7 @@ def _setup_instance(
                         "Installing extraction tools on GPU instance..."
                     )
                     db.commit()
-                    install_cmd = f"apt-get update -qq && apt-get install -y {' '.join(install_packages)} && rm -rf /var/lib/apt/lists/*"
+                    install_cmd = f"apt-get update --fix-missing -qq && apt-get install -y {' '.join(install_packages)} && rm -rf /var/lib/apt/lists/*"
                     print(
                         f"Installing packages on remote instance: {' '.join(install_packages)}"
                     )

@@ -13,12 +13,11 @@ router = APIRouter()
 
 @router.get("/", response_model=SettingsResponse)
 def get_settings(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_admin_user)
+    db: Session = Depends(get_db), current_user: User = Depends(get_current_admin_user)
 ):
     """Get application settings (admin only)"""
     settings = db.query(ApplicationSetting).filter(ApplicationSetting.id == 1).first()
-    
+
     if not settings:
         # Create default settings if none exist
         settings = ApplicationSetting(
@@ -28,12 +27,12 @@ def get_settings(
             max_upload_size_mb=1000,
             max_hash_file_size_mb=50,
             data_retention_days=30,
-            s3_region="us-east-1"
+            s3_region="us-east-1",
         )
         db.add(settings)
         db.commit()
         db.refresh(settings)
-    
+
     return SettingsResponse(
         max_cost_per_hour=float(settings.max_cost_per_hour),
         max_total_cost=float(settings.max_total_cost),
@@ -46,8 +45,9 @@ def get_settings(
         # Only show if keys are configured (don't expose actual values)
         aws_configured=bool(settings.aws_access_key_id_encrypted),
         vast_configured=bool(settings.vast_api_key_encrypted),
+        teams_webhook_configured=bool(settings.teams_webhook_url_encrypted),
         created_at=settings.created_at,
-        updated_at=settings.updated_at
+        updated_at=settings.updated_at,
     )
 
 
@@ -55,49 +55,59 @@ def get_settings(
 def update_settings(
     settings_update: SettingsUpdate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_admin_user)
+    current_user: User = Depends(get_current_admin_user),
 ):
     """Update application settings (admin only)"""
     settings = db.query(ApplicationSetting).filter(ApplicationSetting.id == 1).first()
-    
+
     if not settings:
         settings = ApplicationSetting(id=1)
         db.add(settings)
-    
+
     # Update non-sensitive fields
-    update_data = settings_update.dict(exclude_unset=True, exclude={
-        'aws_access_key_id', 'aws_secret_access_key', 'vast_api_key'
-    })
-    
+    update_data = settings_update.dict(
+        exclude_unset=True,
+        exclude={
+            "aws_access_key_id",
+            "aws_secret_access_key",
+            "vast_api_key",
+            "teams_webhook_url",
+        },
+    )
+
     for field, value in update_data.items():
         if hasattr(settings, field):
             setattr(settings, field, value)
-    
+
     # Update sensitive fields using properties (which handle encryption)
     try:
         if settings_update.aws_access_key_id is not None:
             settings.aws_access_key_id = settings_update.aws_access_key_id
-        
+
         if settings_update.aws_secret_access_key is not None:
             settings.aws_secret_access_key = settings_update.aws_secret_access_key
-        
+
         if settings_update.vast_api_key is not None:
             settings.vast_api_key = settings_update.vast_api_key
+
+        if settings_update.teams_webhook_url is not None:
+            settings.teams_webhook_url = settings_update.teams_webhook_url
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    
+
     db.commit()
     db.refresh(settings)
-    
+
     # Clear settings service cache to ensure fresh credentials are used
     from app.services.settings_service import get_settings_service
+
     try:
         settings_service = get_settings_service()
         settings_service.clear_cache()
     except RuntimeError:
         # Settings service not initialized yet, which is fine
         pass
-    
+
     return SettingsResponse(
         max_cost_per_hour=float(settings.max_cost_per_hour),
         max_total_cost=float(settings.max_total_cost),
@@ -109,34 +119,34 @@ def update_settings(
         vast_cloud_connection_id=settings.vast_cloud_connection_id,
         aws_configured=bool(settings.aws_access_key_id_encrypted),
         vast_configured=bool(settings.vast_api_key_encrypted),
+        teams_webhook_configured=bool(settings.teams_webhook_url_encrypted),
         created_at=settings.created_at,
-        updated_at=settings.updated_at
+        updated_at=settings.updated_at,
     )
 
 
 @router.post("/test-aws")
 def test_aws_connection(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_admin_user)
+    db: Session = Depends(get_db), current_user: User = Depends(get_current_admin_user)
 ):
     """Test AWS S3 connection with current settings"""
     settings = db.query(ApplicationSetting).filter(ApplicationSetting.id == 1).first()
-    
-    #if not settings or not settings.aws_access_key_id or not settings.aws_secret_access_key:
-        #raise HTTPException(status_code=400, detail="AWS credentials not configured")
-    
+
+    # if not settings or not settings.aws_access_key_id or not settings.aws_secret_access_key:
+    # raise HTTPException(status_code=400, detail="AWS credentials not configured")
+
     try:
         import boto3
         from botocore.exceptions import ClientError
-        
+
         # Test S3 connection
         s3_client = boto3.client(
-            's3',
+            "s3",
             aws_access_key_id=settings.aws_access_key_id,
             aws_secret_access_key=settings.aws_secret_access_key,
-            region_name=settings.s3_region
+            region_name=settings.s3_region,
         )
-        
+
         # Try to list objects in the bucket
         if settings.s3_bucket_name:
             s3_client.head_bucket(Bucket=settings.s3_bucket_name)
@@ -144,14 +154,23 @@ def test_aws_connection(
         else:
             # Just test credentials without bucket
             s3_client.list_buckets()
-            return {"status": "success", "message": "AWS credentials valid, but no bucket configured"}
-            
+            return {
+                "status": "success",
+                "message": "AWS credentials valid, but no bucket configured",
+            }
+
     except ClientError as e:
-        error_code = e.response['Error']['Code']
-        if error_code == 'NoSuchBucket':
-            return {"status": "warning", "message": f"Bucket '{settings.s3_bucket_name}' does not exist"}
-        elif error_code == 'AccessDenied':
-            return {"status": "error", "message": "Access denied - check your AWS credentials and permissions"}
+        error_code = e.response["Error"]["Code"]
+        if error_code == "NoSuchBucket":
+            return {
+                "status": "warning",
+                "message": f"Bucket '{settings.s3_bucket_name}' does not exist",
+            }
+        elif error_code == "AccessDenied":
+            return {
+                "status": "error",
+                "message": "Access denied - check your AWS credentials and permissions",
+            }
         else:
             return {"status": "error", "message": f"AWS error: {error_code}"}
     except Exception as e:
@@ -160,30 +179,65 @@ def test_aws_connection(
 
 @router.post("/test-vast")
 def test_vast_connection(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_admin_user)
+    db: Session = Depends(get_db), current_user: User = Depends(get_current_admin_user)
 ):
     """Test Vast.ai API connection with current settings"""
     settings = db.query(ApplicationSetting).filter(ApplicationSetting.id == 1).first()
-    
+
     if not settings or not settings.vast_api_key:
         raise HTTPException(status_code=400, detail="Vast.ai API key not configured")
-    
+
     try:
         import requests
-        
+
         # Test Vast.ai API connection
-        headers = {'Authorization': f'Bearer {settings.vast_api_key}'}
-        response = requests.get('https://console.vast.ai/api/v0/instances', headers=headers, timeout=10)
-        
+        headers = {"Authorization": f"Bearer {settings.vast_api_key}"}
+        response = requests.get(
+            "https://console.vast.ai/api/v0/instances", headers=headers, timeout=10
+        )
+
         if response.status_code == 200:
             return {"status": "success", "message": "Vast.ai API connection successful"}
         elif response.status_code == 401:
             return {"status": "error", "message": "Invalid Vast.ai API key"}
         else:
-            return {"status": "error", "message": f"Vast.ai API error: {response.status_code}"}
-            
+            return {
+                "status": "error",
+                "message": f"Vast.ai API error: {response.status_code}",
+            }
+
     except requests.exceptions.Timeout:
-        return {"status": "error", "message": "Connection timeout - check your internet connection"}
+        return {
+            "status": "error",
+            "message": "Connection timeout - check your internet connection",
+        }
+    except Exception as e:
+        return {"status": "error", "message": f"Connection failed: {str(e)}"}
+
+
+@router.post("/test-teams")
+def test_teams_connection(
+    db: Session = Depends(get_db), current_user: User = Depends(get_current_admin_user)
+):
+    """Test Microsoft Teams webhook with current settings"""
+    settings = db.query(ApplicationSetting).filter(ApplicationSetting.id == 1).first()
+
+    if not settings or not settings.teams_webhook_url:
+        raise HTTPException(status_code=400, detail="Teams webhook URL not configured")
+
+    try:
+        from app.services.notification_service import send_test_notification
+
+        success = send_test_notification(settings.teams_webhook_url)
+        if success:
+            return {
+                "status": "success",
+                "message": "Teams webhook test card sent successfully",
+            }
+        else:
+            return {
+                "status": "error",
+                "message": "Failed to send test card — check the webhook URL",
+            }
     except Exception as e:
         return {"status": "error", "message": f"Connection failed: {str(e)}"}
