@@ -1344,6 +1344,37 @@ def _setup_instance(
 
             if compression_format:
                 print(f"Compressed wordlist detected: {compression_format} format")
+
+                # Install extraction tools on the remote instance if needed
+                install_packages = []
+                if compression_format == "7z":
+                    install_packages.append("p7zip-full")
+                elif compression_format == "zip":
+                    install_packages.append("unzip")
+                # gz (gunzip) and bz2 (bunzip2) are available in the base image
+
+                if install_packages:
+                    job.status_message = (
+                        "Installing extraction tools on GPU instance..."
+                    )
+                    db.commit()
+                    install_cmd = f"apt-get update -qq && apt-get install -y {' '.join(install_packages)} && rm -rf /var/lib/apt/lists/*"
+                    print(
+                        f"Installing packages on remote instance: {' '.join(install_packages)}"
+                    )
+                    install_result = asyncio.run(
+                        vast_client.execute_command(
+                            instance_id, install_cmd, ssh_key_path
+                        )
+                    )
+                    if install_result.get("returncode") != 0:
+                        error_msg = install_result.get("stderr", "Unknown error")
+                        print(f"Package installation failed: {error_msg}")
+                        raise Exception(
+                            f"Failed to install extraction tools ({', '.join(install_packages)}): {error_msg[:200]}"
+                        )
+                    print(f"Successfully installed: {' '.join(install_packages)}")
+
                 job.status_message = (
                     f"Extracting compressed wordlist ({compression_format})..."
                 )
