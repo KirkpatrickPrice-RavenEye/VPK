@@ -72,7 +72,22 @@ export default function JobDetailPage() {
 
         setJob(jobWithStats);
         setLogs(logs.status === 'fulfilled' ? logs.value.logs : 'No logs available');
-        setPotFilePreview(potPreview.status === 'fulfilled' ? potPreview.value : null);
+
+        // Fix 2: Sync crackedCount from stats, taking the higher value to avoid
+        // clobbering a live SSE count with a potentially stale stats value.
+        if (stats.status === 'fulfilled' && stats.value.cracked_hashes) {
+          setCrackedCount(prev => Math.max(prev, stats.value.cracked_hashes));
+        }
+
+        // Fix 1: Only set potFilePreview from the REST endpoint if SSE has not
+        // already populated it. The SSE pot_update events deliver reliable live
+        // data; fetchJobDetails() runs after job_finished and may race against
+        // the backend finalising the pot file, causing the preview to appear
+        // empty even when passwords were cracked.
+        setPotFilePreview(prev => {
+          if (prev && prev.preview && prev.total_lines_shown > 0) return prev;
+          return potPreview.status === 'fulfilled' ? potPreview.value : null;
+        });
       } else {
         setJob(jobData);
         // For non-completed jobs, still try to get logs
@@ -279,12 +294,15 @@ export default function JobDetailPage() {
                     time_finished: data.time_finished,
                     actual_cost: data.actual_cost,
                   } : null);
-                  // Fetch final data asynchronously using ref to avoid dependency
+                  // Fix 3: Fetch final data after a generous delay so the backend
+                  // has time to finish writing the pot file before we read it via
+                  // the REST preview endpoint. 100ms was too short and could race
+                  // against _retrieve_results() writing the final pot file.
                   setTimeout(() => {
                     if (fetchJobDetailsRef.current) {
                       fetchJobDetailsRef.current();
                     }
-                  }, 100);
+                  }, 2000);
                   shouldContinue = false;
                   break;
 
