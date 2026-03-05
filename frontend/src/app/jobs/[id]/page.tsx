@@ -638,7 +638,7 @@ export default function JobDetailPage() {
                     Stop Job
                   </Button>
                 )}
-                {job.cracked_hashes !== undefined && job.cracked_hashes > 0 && (
+                {(crackedCount > 0 || (job.cracked_hashes !== undefined && job.cracked_hashes > 0)) && (
                   <Button 
                     variant="outline" 
                     onClick={handleDownloadResults}
