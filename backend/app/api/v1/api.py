@@ -1,5 +1,5 @@
 from fastapi import APIRouter
-from app.api.v1 import auth, users, jobs, storage, events, vast, settings
+from app.api.v1 import auth, users, jobs, storage, events, vast, settings, ws
 
 api_router = APIRouter()
 
@@ -10,3 +10,4 @@ api_router.include_router(storage.router, prefix="/storage", tags=["storage"])
 api_router.include_router(events.router, prefix="/events", tags=["events"])
 api_router.include_router(vast.router, prefix="/vast", tags=["vast"])
 api_router.include_router(settings.router, prefix="/settings", tags=["settings"])
+api_router.include_router(ws.router, prefix="/ws", tags=["websocket"])

@@ -12,6 +12,8 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.core.celery_app import celery_app
 from app.core.database import SessionLocal
+from app.core.event_bus import publish_job_event
+from app.core import event_types as ET
 from app.models.job import Job, JobStatus
 from app.services.vast_client import VastAIClient
 from app.services.s3_client import S3Client
@@ -26,6 +28,97 @@ logger = get_task_logger(__name__)
 def get_db() -> Session:
     """Get database session for tasks"""
     return SessionLocal()
+
+
+def _publish_job_update(job: "Job", user_id: str = None) -> None:
+    """Publish a JOB_UPDATE event carrying the current job state.
+
+    Call this immediately after ``db.commit()`` for any change to status,
+    progress, or status_message.
+    """
+    publish_job_event(
+        str(job.id),
+        ET.JOB_UPDATE,
+        {
+            "status": job.status.value,
+            "progress": job.progress,
+            "status_message": job.status_message,
+            "error_message": job.error_message,
+            "time_started": job.time_started.isoformat() if job.time_started else None,
+            "time_finished": job.time_finished.isoformat()
+            if job.time_finished
+            else None,
+            "actual_cost": float(job.actual_cost) if job.actual_cost else 0.0,
+            "estimated_time": job.estimated_time,
+        },
+        user_id=str(job.user_id) if job.user_id else user_id,
+    )
+
+
+def _publish_job_finished(job: "Job", total_cracked: int = 0) -> None:
+    """Publish a JOB_FINISHED event with the full terminal state.
+
+    Carries all data the frontend needs so it never has to make a follow-up
+    REST call.  Call after the final ``db.commit()`` that sets the terminal
+    status.
+    """
+    publish_job_event(
+        str(job.id),
+        ET.JOB_FINISHED,
+        {
+            "status": job.status.value,
+            "progress": job.progress,
+            "status_message": job.status_message,
+            "error_message": job.error_message,
+            "time_started": job.time_started.isoformat() if job.time_started else None,
+            "time_finished": job.time_finished.isoformat()
+            if job.time_finished
+            else None,
+            "actual_cost": float(job.actual_cost) if job.actual_cost else 0.0,
+            "total_cracked": total_cracked,
+        },
+        user_id=str(job.user_id) if job.user_id else None,
+    )
+
+
+def _publish_pot_update(job: "Job", pot_content: str) -> None:
+    """Publish a POT_UPDATE event with the latest cracked passwords.
+
+    Parses ``pot_content`` (the raw content of the remote pot file, excluding
+    comment lines) and pushes the count and a preview to the frontend.
+    """
+    lines = [
+        line.strip()
+        for line in pot_content.splitlines()
+        if line.strip() and not line.startswith("#")
+    ]
+    preview = lines[-100:] if len(lines) > 100 else lines
+    publish_job_event(
+        str(job.id),
+        ET.POT_UPDATE,
+        {
+            "total_cracked": len(lines),
+            "preview": preview,
+            "truncated": len(lines) > 100,
+        },
+        user_id=str(job.user_id) if job.user_id else None,
+    )
+
+
+def _publish_log_update(job: "Job", new_content: str, append: bool = True) -> None:
+    """Publish a LOG_UPDATE event with new log lines."""
+    lines = new_content.split("\n")
+    # Strip trailing empty line
+    if lines and not lines[-1]:
+        lines = lines[:-1]
+    if not lines:
+        return
+    publish_job_event(
+        str(job.id),
+        ET.LOG_UPDATE,
+        {"lines": lines, "append": append},
+        user_id=str(job.user_id) if job.user_id else None,
+    )
 
 
 def _cleanup_ssh_keys(instance_id: int):
@@ -228,6 +321,7 @@ def execute_job(self, job_id: str):
         job.status_message = "Initializing job execution..."
         job.time_started = datetime.now(timezone.utc)
         db.commit()
+        _publish_job_update(job)
 
         # Execute job workflow
         result = _execute_job_workflow(job, db)
@@ -264,6 +358,7 @@ def execute_job(self, job_id: str):
             job.error_message = str(e)
             job.time_finished = datetime.now(timezone.utc)
             db.commit()
+            _publish_job_finished(job)
 
         raise e
     finally:
@@ -357,6 +452,7 @@ def _handle_job_timeout(job: Job, db: Session, is_soft_timeout: bool = True):
         # Final database update
         job.error_message = f"Job execution cancelled due to time limit exceeded ({'soft' if is_soft_timeout else 'hard'} timeout at {datetime.now(timezone.utc)})"
         db.commit()
+        _publish_job_finished(job)
 
         logger.info(f"Timeout cleanup completed for job {job.id}")
 
@@ -368,6 +464,7 @@ def _handle_job_timeout(job: Job, db: Session, is_soft_timeout: bool = True):
             job.error_message = f"Job failed due to timeout and cleanup error: {str(e)}"
             job.time_finished = datetime.now(timezone.utc)
             db.commit()
+            _publish_job_finished(job)
         except Exception as db_error:
             logger.error(
                 f"Failed to update job status during timeout cleanup: {db_error}"
@@ -454,6 +551,7 @@ def _execute_job_workflow(job: Job, db: Session) -> Dict[str, Any]:
         # Step 1: Validate hash file
         job.status_message = "Validating hash file..."
         db.commit()
+        _publish_job_update(job)
         validation = hashcat_service.validate_hash_file(
             job.hash_file_path, job.hash_type
         )
@@ -463,6 +561,7 @@ def _execute_job_workflow(job: Job, db: Session) -> Dict[str, Any]:
         # Step 2: Use the user-selected instance or get available instances as fallback
         job.status_message = "Finding available GPU instances..."
         db.commit()
+        _publish_job_update(job)
 
         if job.instance_type:
             # User selected a specific instance - try to use that offer ID
@@ -472,6 +571,7 @@ def _execute_job_workflow(job: Job, db: Session) -> Dict[str, Any]:
                 f"Checking availability of selected instance {selected_offer_id}..."
             )
             db.commit()
+            _publish_job_update(job)
 
             # Get all current offers
             try:
@@ -685,6 +785,7 @@ def _execute_job_workflow(job: Job, db: Session) -> Dict[str, Any]:
         # Step 3: Create instance
         job.status_message = f"Creating GPU instance: {best_offer.get('gpu_name', 'Unknown GPU')} (${best_offer.get('dph_total', 0):.3f}/hour)..."
         db.commit()
+        _publish_job_update(job)
 
         # Get required disk size from job, default to 20GB
         required_disk = getattr(job, "required_disk_gb", 20) or 20
@@ -707,6 +808,7 @@ def _execute_job_workflow(job: Job, db: Session) -> Dict[str, Any]:
         job.status = JobStatus.RUNNING
         job.status_message = f"Waiting for GPU instance {instance_id} to boot up..."
         db.commit()
+        _publish_job_update(job)
 
         # Step 4: Wait for instance to be ready
         ready = asyncio.run(
@@ -718,6 +820,7 @@ def _execute_job_workflow(job: Job, db: Session) -> Dict[str, Any]:
         # Step 4.1: Generate and attach SSH key to the instance
         job.status_message = "Setting up secure connection to GPU instance..."
         db.commit()
+        _publish_job_update(job)
 
         logger.info(f"Creating and attaching SSH key to instance {instance_id}...")
         ssh_key_path = None
@@ -833,6 +936,7 @@ def _execute_job_workflow(job: Job, db: Session) -> Dict[str, Any]:
         # Step 5: Setup instance and transfer files
         job.status_message = "Transferring files and preparing environment..."
         db.commit()
+        _publish_job_update(job)
         final_wordlist_path, rules_paths = _setup_instance(
             vast_client, instance_id, job, db, ssh_key_path
         )
@@ -873,10 +977,12 @@ def _execute_job_workflow(job: Job, db: Session) -> Dict[str, Any]:
         # Set pot file path on job immediately so SSE can stream it
         job.pot_file_path = pot_file_path
         db.commit()
+        _publish_job_update(job)
 
         # Step 6: Execute hashcat with time limit monitoring
         job.status_message = "Starting password cracking process..."
         db.commit()
+        _publish_job_update(job)
         _execute_hashcat(
             vast_client,
             instance_id,
@@ -904,6 +1010,7 @@ def _execute_job_workflow(job: Job, db: Session) -> Dict[str, Any]:
                 job.status = JobStatus.CANCELLED
                 job.error_message = "Job stopped due to hard time limit"
                 db.commit()
+                _publish_job_finished(job)
 
         # Step 7: Retrieve results (but only if job hasn't been cancelled)
         # Refresh job status to check if it was cancelled while running
@@ -925,6 +1032,7 @@ def _execute_job_workflow(job: Job, db: Session) -> Dict[str, Any]:
                 ]:
                     job.status_message = "Retrieving results and cleaning up..."
                     db.commit()
+                    _publish_job_update(job)
                     _retrieve_results(vast_client, instance_id, job, db, ssh_key_path)
                 else:
                     print(
@@ -943,6 +1051,7 @@ def _execute_job_workflow(job: Job, db: Session) -> Dict[str, Any]:
         # the /pot/preview endpoint to return nothing and the UI to flash
         # "No cracked passwords available".
         db.commit()
+        _publish_job_update(job)
 
         # Verify pot file is fully written to disk before we expose COMPLETED.
         if job.pot_file_path:
@@ -985,6 +1094,20 @@ def _execute_job_workflow(job: Job, db: Session) -> Dict[str, Any]:
             job.actual_cost = duration_hours * best_offer.get("dph_total", 0)
 
         db.commit()
+        _publish_job_update(job)
+
+        # Publish final completion event – carries all data the frontend needs
+        # so it never has to make a follow-up REST call.
+        _final_cracked = 0
+        if job.pot_file_path and os.path.isfile(job.pot_file_path):
+            try:
+                with open(job.pot_file_path, "r") as _pf:
+                    _final_cracked = sum(
+                        1 for ln in _pf if ln.strip() and not ln.startswith("#")
+                    )
+            except Exception:
+                pass
+        _publish_job_finished(job, total_cracked=_final_cracked)
 
         # Send Teams notification (non-blocking – errors are logged, not raised)
         try:
@@ -1016,6 +1139,7 @@ def _execute_job_workflow(job: Job, db: Session) -> Dict[str, Any]:
         job.error_message = str(e)
         job.time_finished = datetime.now(timezone.utc)
         db.commit()
+        _publish_job_finished(job)
 
         # Send Teams failure notification (non-blocking)
         try:
@@ -1104,6 +1228,7 @@ def _setup_instance(
     try:
         job.status_message = "Setting up workspace on GPU instance..."
         db.commit()
+        _publish_job_update(job)
         print("Creating workspace directory...")
         mkdir_result = asyncio.run(
             vast_client.execute_command(
@@ -1129,6 +1254,7 @@ def _setup_instance(
 
         job.status_message = "Uploading hash file to GPU instance (secure streaming)..."
         db.commit()
+        _publish_job_update(job)
         print(f"Streaming hash file from {job.hash_file_path} to instance via SSH...")
 
         # Get SSH connection details
@@ -1281,6 +1407,7 @@ def _setup_instance(
     if job.word_list:
         job.status_message = "Preparing to download wordlist from cloud storage..."
         db.commit()
+        _publish_job_update(job)
         logger.info(f"Preparing to download wordlist from S3: {job.word_list}")
 
         try:
@@ -1339,6 +1466,7 @@ def _setup_instance(
                             f"Downloaded wordlist ({file_size_mb:.1f} MB)"
                         )
                     db.commit()
+                    _publish_job_update(job)
                 except Exception as e:
                     print(f"Failed to parse file size: {e}")
             else:
@@ -1393,6 +1521,7 @@ def _setup_instance(
                         "Installing extraction tools on GPU instance..."
                     )
                     db.commit()
+                    _publish_job_update(job)
                     install_cmd = f"apt-get update --fix-missing -qq && apt-get install -y {' '.join(install_packages)} && rm -rf /var/lib/apt/lists/*"
                     print(
                         f"Installing packages on remote instance: {' '.join(install_packages)}"
@@ -1414,6 +1543,7 @@ def _setup_instance(
                     f"Extracting compressed wordlist ({compression_format})..."
                 )
                 db.commit()
+                _publish_job_update(job)
 
                 # Create extracted filename based on original
                 base_name = wordlist_filename
@@ -1473,6 +1603,7 @@ def _setup_instance(
                 )
                 job.status_message = "Wordlist extraction completed"
                 db.commit()
+                _publish_job_update(job)
 
                 # Clean up compressed file to save space
                 cleanup_cmd = f"rm -f '{input_path}'"
@@ -1641,6 +1772,7 @@ def _execute_hashcat(
     job.status_message = "Running hashcat password cracking..."
     job.progress = 5
     db.commit()
+    _publish_job_update(job)
 
     print(f"Executing hashcat command: {hashcat_cmd}")
 
@@ -1768,6 +1900,7 @@ exit 0
                     job.error_message = f"Job stopped due to hard time limit exceeded at {datetime.now(timezone.utc)}"
                     job.time_finished = datetime.now(timezone.utc)
                     db.commit()
+                    _publish_job_finished(job)
                     break
 
             # Check if hashcat process is still running
@@ -1854,6 +1987,9 @@ exit 0
                                         print(
                                             f"DEBUG: Wrote {len(new_content)} bytes to local log (position: {last_log_position})"
                                         )
+                                        _publish_log_update(
+                                            job, new_content, append=True
+                                        )
                         except Exception as log_error:
                             print(f"DEBUG: Failed to write log content: {log_error}")
 
@@ -1924,6 +2060,7 @@ exit 0
                                                     except OSError:
                                                         pass
                                                     raise
+                                                _publish_pot_update(job, pot_content)
                                                 print(
                                                     f"DEBUG: Updated pot file with {len(pot_content)} bytes ({len(pot_content.splitlines())} lines)"
                                                 )
@@ -1994,6 +2131,7 @@ exit 0
                         job.progress = 100
                         job.status_message = "Password cracking completed"
                         db.commit()
+                        _publish_job_update(job)
 
                 # List all workspace files for debugging
                 workspace_files = asyncio.run(
@@ -2015,6 +2153,7 @@ exit 0
                 )
                 job.status = JobStatus.FAILED
                 db.commit()
+                _publish_job_finished(job)
                 break
 
             # Wait before next check (5 seconds for responsive updates)
@@ -2031,6 +2170,7 @@ exit 0
                 job.error_message = f"Monitoring failed: {str(e)}"
                 job.status = JobStatus.FAILED
                 db.commit()
+                _publish_job_finished(job)
                 break
 
             # Wait before retrying
@@ -2146,6 +2286,7 @@ def _parse_hashcat_progress_realtime(output: str, job: Job, db: Session):
                     )
 
                 db.commit()
+                _publish_job_update(job)
 
                 print(
                     f"Real-time progress: {progress_current:,}/{progress_total:,} ({progress_pct}%){speed_msg}{eta_msg}"
@@ -2156,36 +2297,42 @@ def _parse_hashcat_progress_realtime(output: str, job: Job, db: Session):
             job.progress = max(job.progress, 10)
             job.status_message = "Analyzing hash file and counting entries..."
             db.commit()
+            _publish_job_update(job)
             print(f"Updated status: {job.status_message} ({job.progress}%)")
 
         if "Parsed Hashes:" in output:
             job.progress = max(job.progress, 15)
             job.status_message = "Parsing and validating hash format..."
             db.commit()
+            _publish_job_update(job)
             print(f"Updated status: {job.status_message} ({job.progress}%)")
 
         if "Removed duplicate hashes" in output:
             job.progress = max(job.progress, 18)
             job.status_message = "Removing duplicate hashes..."
             db.commit()
+            _publish_job_update(job)
             print(f"Updated status: {job.status_message} ({job.progress}%)")
 
         if "Sorted salts" in output:
             job.progress = max(job.progress, 20)
             job.status_message = "Sorting and optimizing hash data..."
             db.commit()
+            _publish_job_update(job)
             print(f"Updated status: {job.status_message} ({job.progress}%)")
 
         if "Compared hashes with potfile entries" in output:
             job.progress = max(job.progress, 22)
             job.status_message = "Checking for previously cracked hashes..."
             db.commit()
+            _publish_job_update(job)
             print(f"Updated status: {job.status_message} ({job.progress}%)")
 
         if "Generated bitmap tables" in output:
             job.progress = max(job.progress, 24)
             job.status_message = "Generating optimization tables..."
             db.commit()
+            _publish_job_update(job)
             print(f"Updated status: {job.status_message} ({job.progress}%)")
 
         if (
@@ -2195,24 +2342,28 @@ def _parse_hashcat_progress_realtime(output: str, job: Job, db: Session):
             job.progress = max(job.progress, 25)
             job.status_message = "Initializing GPU compute kernels..."
             db.commit()
+            _publish_job_update(job)
             print(f"Updated status: {job.status_message} ({job.progress}%)")
 
         if "Initialized device kernels and memory" in output:
             job.progress = max(job.progress, 30)
             job.status_message = "GPU kernels initialized successfully..."
             db.commit()
+            _publish_job_update(job)
             print(f"Updated status: {job.status_message} ({job.progress}%)")
 
         if "Starting self-test" in output:
             job.progress = max(job.progress, 32)
             job.status_message = "Running GPU self-test..."
             db.commit()
+            _publish_job_update(job)
             print(f"Updated status: {job.status_message} ({job.progress}%)")
 
         if "Finished self-test" in output:
             job.progress = max(job.progress, 35)
             job.status_message = "GPU self-test completed successfully..."
             db.commit()
+            _publish_job_update(job)
             print(f"Updated status: {job.status_message} ({job.progress}%)")
 
         if "Dictionary cache building" in output:
@@ -2237,6 +2388,7 @@ def _parse_hashcat_progress_realtime(output: str, job: Job, db: Session):
                                 f"Building dictionary cache: {cache_pct:.1f}%..."
                             )
                             db.commit()
+                            _publish_job_update(job)
                             print(
                                 f"Updated status: {job.status_message} ({job.progress}%)"
                             )
@@ -2245,29 +2397,34 @@ def _parse_hashcat_progress_realtime(output: str, job: Job, db: Session):
                     job.progress = max(job.progress, 40)
                     job.status_message = "Building dictionary cache from wordlist..."
                     db.commit()
+                    _publish_job_update(job)
                     print(f"Updated status: {job.status_message} ({job.progress}%)")
             else:
                 job.progress = max(job.progress, 40)
                 job.status_message = "Building dictionary cache from wordlist..."
                 db.commit()
+                _publish_job_update(job)
                 print(f"Updated status: {job.status_message} ({job.progress}%)")
 
         if "Dictionary cache built" in output:
             job.progress = max(job.progress, 50)
             job.status_message = "Dictionary cache ready, starting attack..."
             db.commit()
+            _publish_job_update(job)
             print(f"Updated status: {job.status_message} ({job.progress}%)")
 
         if "Starting autotune" in output:
             job.progress = max(job.progress, 52)
             job.status_message = "Auto-tuning GPU performance settings..."
             db.commit()
+            _publish_job_update(job)
             print(f"Updated status: {job.status_message} ({job.progress}%)")
 
         if "Finished autotune" in output:
             job.progress = max(job.progress, 55)
             job.status_message = "Starting cracking..."
             db.commit()
+            _publish_job_update(job)
             print(f"Updated status: {job.status_message} ({job.progress}%)")
 
         # Check if job completed based on various indicators
@@ -2283,6 +2440,7 @@ def _parse_hashcat_progress_realtime(output: str, job: Job, db: Session):
             job.progress = 100
             job.status_message = "Password cracking completed!"
             db.commit()
+            _publish_job_update(job)
             print(f"Updated status: {job.status_message} ({job.progress}%)")
 
     except Exception as e:
@@ -2367,6 +2525,7 @@ def _parse_hashcat_progress(stdout: str, job: Job, db: Session):
                     job.progress = progress_pct
                     job.status_message = f"Cracking passwords: {progress_pct}% complete{speed_msg}{eta_msg}"
                     db.commit()
+                    _publish_job_update(job)
 
                     print(
                         f"Progress update: {progress_current:,}/{progress_total:,} ({progress_pct}%){speed_msg}{eta_msg}"
@@ -2377,24 +2536,29 @@ def _parse_hashcat_progress(stdout: str, job: Job, db: Session):
             job.progress = 100
             job.status_message = "Password cracking completed, processing results..."
             db.commit()
+            _publish_job_update(job)
 
         # Look for specific hashcat phases with more detailed messages
         elif "Counting lines" in stdout:
             job.progress = 10
             job.status_message = "Analyzing hash file and counting entries..."
             db.commit()
+            _publish_job_update(job)
         elif "Parsing" in stdout and "Hashes:" in stdout:
             job.progress = 15
             job.status_message = "Parsing and validating hash format..."
             db.commit()
+            _publish_job_update(job)
         elif "Removing duplicate hashes" in stdout:
             job.progress = 18
             job.status_message = "Removing duplicate hashes..."
             db.commit()
+            _publish_job_update(job)
         elif "Initializing device kernels" in stdout:
             job.progress = 25
             job.status_message = "Initializing GPU compute kernels..."
             db.commit()
+            _publish_job_update(job)
         elif "Dictionary cache building" in stdout:
             # Check percentage from the cache building line
             cache_lines = [
@@ -2418,14 +2582,17 @@ def _parse_hashcat_progress(stdout: str, job: Job, db: Session):
                 job.progress = 35
                 job.status_message = "Building dictionary cache from wordlist..."
             db.commit()
+            _publish_job_update(job)
         elif "Starting autotune" in stdout:
             job.progress = 48
             job.status_message = "Auto-tuning GPU performance settings..."
             db.commit()
+            _publish_job_update(job)
         elif "Finished autotune" in stdout:
             job.progress = 50
             job.status_message = "Starting password attack..."
             db.commit()
+            _publish_job_update(job)
 
     except Exception as e:
         print(f"Error parsing hashcat progress: {e}")
@@ -2659,6 +2826,7 @@ def _retrieve_results(
         print(f"Failed to retrieve logs: {e}")
 
     db.commit()
+    _publish_job_update(job)
 
 
 @celery_app.task
@@ -2701,6 +2869,7 @@ def cleanup_old_jobs():
             db.delete(job)
 
         db.commit()
+        _publish_job_update(job)
         return f"Cleaned up {len(old_jobs)} old jobs"
 
     finally:
@@ -2738,6 +2907,7 @@ def stop_job(job_id: str):
             job.status = JobStatus.CANCELLING
             job.time_finished = datetime.now(timezone.utc)
             db.commit()
+            _publish_job_update(job)
 
             # Step 1.5: Generate SSH key for stop operations (reuse existing if available)
             try:
@@ -2855,6 +3025,7 @@ def stop_job(job_id: str):
         # Step 5: Final status update
         job.status = JobStatus.CANCELLED
         db.commit()
+        _publish_job_finished(job)
 
         return {"status": "stopped", "job_id": job_id, "instance_destroyed": True}
 
@@ -3054,3 +3225,4 @@ def _retrieve_results_fast(
         )
 
     db.commit()
+    _publish_job_update(job)
