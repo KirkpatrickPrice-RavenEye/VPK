@@ -336,8 +336,8 @@ export default function JobDetailPage() {
         console.error('SSE connection error:', error);
         setSseConnected(false);
 
-        // Don't retry if aborted
-        if (error.name !== 'AbortError') {
+        // Don't retry if we intentionally aborted (unmount / job change)
+        if (error.name !== 'AbortError' && !abortController.signal.aborted) {
           console.log('SSE will retry connection in 5 seconds...');
           // Retry connection after delay
           setTimeout(() => {
