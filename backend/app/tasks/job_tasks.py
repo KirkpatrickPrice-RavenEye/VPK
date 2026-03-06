@@ -1136,7 +1136,21 @@ def _execute_job_workflow(job: Job, db: Session) -> Dict[str, Any]:
                 db.refresh(job)
                 user = job.user
                 if user:
-                    send_job_notification(job, user.email, webhook_url)
+                    # Count total hashes from hash file
+                    _total_hashes = 0
+                    if job.hash_file_path and os.path.isfile(job.hash_file_path):
+                        try:
+                            with open(job.hash_file_path, "r", encoding="utf-8", errors="ignore") as _hf:
+                                _total_hashes = sum(1 for ln in _hf if ln.strip())
+                        except Exception:
+                            pass
+                    send_job_notification(
+                        job,
+                        user.email,
+                        webhook_url,
+                        total_hashes=_total_hashes,
+                        cracked_hashes=_final_cracked,
+                    )
                 else:
                     logger.warning(
                         f"Could not load user for job {job.id} – skipping Teams notification"
@@ -1167,7 +1181,30 @@ def _execute_job_workflow(job: Job, db: Session) -> Dict[str, Any]:
                 db.refresh(job)
                 user = job.user
                 if user:
-                    send_job_notification(job, user.email, webhook_url)
+                    # Count hashes for failure notification
+                    _fail_total = 0
+                    if job.hash_file_path and os.path.isfile(job.hash_file_path):
+                        try:
+                            with open(job.hash_file_path, "r", encoding="utf-8", errors="ignore") as _hf:
+                                _fail_total = sum(1 for ln in _hf if ln.strip())
+                        except Exception:
+                            pass
+                    _fail_cracked = 0
+                    if job.pot_file_path and os.path.isfile(job.pot_file_path):
+                        try:
+                            with open(job.pot_file_path, "r", encoding="utf-8", errors="ignore") as _pf:
+                                _fail_cracked = sum(
+                                    1 for ln in _pf if ln.strip() and not ln.startswith("#")
+                                )
+                        except Exception:
+                            pass
+                    send_job_notification(
+                        job,
+                        user.email,
+                        webhook_url,
+                        total_hashes=_fail_total,
+                        cracked_hashes=_fail_cracked,
+                    )
                 else:
                     logger.warning(
                         f"Could not load user for job {job.id} – skipping Teams failure notification"
