@@ -17,7 +17,7 @@ from app.models.job import Job, JobStatus
 logger = logging.getLogger(__name__)
 
 
-def _build_job_card(job: Job, user_email: str) -> dict:
+def _build_job_card(job: Job, user_email: str, total_hashes: int = 0, cracked_hashes: int = 0) -> dict:
     """
     Build a Microsoft Teams Adaptive Card payload for a job terminal notification.
 
@@ -58,9 +58,6 @@ def _build_job_card(job: Job, user_email: str) -> dict:
         else:
             duration_str = f"{minutes}m {seconds}s"
 
-    # Cost string
-    cost_str = f"${float(job.actual_cost):.4f}" if job.actual_cost else "N/A"
-
     # @mention tag used both in the TextBlock and in the entities list
     mention_tag = f"<at>{user_email}</at>"
 
@@ -89,8 +86,7 @@ def _build_job_card(job: Job, user_email: str) -> dict:
                 {"title": "Status", "value": status_label},
                 {"title": "Hash Type", "value": job.hash_type or "N/A"},
                 {"title": "Duration", "value": duration_str or "N/A"},
-                {"title": "Cost", "value": cost_str},
-                {"title": "Created By", "value": user_email},
+                {"title": "Hashes Cracked", "value": f"{cracked_hashes} / {total_hashes}"},
             ],
         },
     ]
@@ -118,6 +114,7 @@ def _build_job_card(job: Job, user_email: str) -> dict:
                     "type": "AdaptiveCard",
                     "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
                     "version": "1.0",
+                    "summary": f"VPK Job {status_label}: {job.name}",
                     "body": body,
                     "msteams": {
                         "entities": [
@@ -173,6 +170,8 @@ def send_job_notification(
     job: Job,
     user_email: str,
     webhook_url: str,
+    total_hashes: int = 0,
+    cracked_hashes: int = 0,
 ) -> None:
     """
     Post a Teams Adaptive Card notification for a terminal job event.
@@ -190,7 +189,7 @@ def send_job_notification(
         return
 
     try:
-        payload = _build_job_card(job, user_email)
+        payload = _build_job_card(job, user_email, total_hashes=total_hashes, cracked_hashes=cracked_hashes)
         response = httpx.post(
             webhook_url,
             json=payload,

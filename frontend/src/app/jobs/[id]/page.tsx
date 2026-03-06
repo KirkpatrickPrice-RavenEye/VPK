@@ -24,12 +24,15 @@ import {
   Loader2,
   ArrowDown
 } from 'lucide-react';
+import { useJobWebSocket } from '@/hooks/useJobWebSocket';
 
 interface JobWithStats extends Job {
   total_hashes?: number;
   cracked_hashes?: number;
   success_rate?: number;
 }
+
+const ACTIVE_STATUSES = ['queued', 'instance_creating', 'running'];
 
 export default function JobDetailPage() {
   const params = useParams();
@@ -42,24 +45,19 @@ export default function JobDetailPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [actionLoading, setActionLoading] = useState(false);
-  const [sseConnected, setSseConnected] = useState(false);
   const [autoScroll, setAutoScroll] = useState(true);
-  const [sseInitialized, setSseInitialized] = useState(false);
-  const [sseConnectionTrigger, setSseConnectionTrigger] = useState(0);
   const [crackedCount, setCrackedCount] = useState(0);
   const logsEndRef = useRef<HTMLDivElement>(null);
-  const jobStatusRef = useRef<string>('');
-  const prevStatusRef = useRef<string>('');
-  const fetchJobDetailsRef = useRef<() => Promise<void>>();
+
+  const isActive = job ? ACTIVE_STATUSES.includes(job.status.toLowerCase()) : false;
 
   const fetchJobDetails = useCallback(async () => {
     try {
-      // Fetch job details
       const jobData = await jobApi.getJob(jobId);
-      
-      // Fetch additional data for completed jobs
-      if (jobData.status.toLowerCase() === 'completed') {
-        const [stats, logs, potPreview] = await Promise.allSettled([
+
+      const terminalStatuses = ['completed', 'cancelled', 'failed'];
+      if (terminalStatuses.includes(jobData.status.toLowerCase())) {
+        const [stats, logsResult, potPreview] = await Promise.allSettled([
           jobApi.getJobStats(jobId),
           jobApi.getJobLogs(jobId),
           jobApi.getPotFilePreview(jobId)
@@ -71,26 +69,19 @@ export default function JobDetailPage() {
         };
 
         setJob(jobWithStats);
-        setLogs(logs.status === 'fulfilled' ? logs.value.logs : 'No logs available');
+        setLogs(logsResult.status === 'fulfilled' ? logsResult.value.logs : 'No logs available');
 
-        // Fix 2: Sync crackedCount from stats, taking the higher value to avoid
-        // clobbering a live SSE count with a potentially stale stats value.
         if (stats.status === 'fulfilled' && stats.value.cracked_hashes) {
           setCrackedCount(prev => Math.max(prev, stats.value.cracked_hashes));
         }
 
-        // Fix 1: Only set potFilePreview from the REST endpoint if SSE has not
-        // already populated it. The SSE pot_update events deliver reliable live
-        // data; fetchJobDetails() runs after job_finished and may race against
-        // the backend finalising the pot file, causing the preview to appear
-        // empty even when passwords were cracked.
+        // Only replace potFilePreview from REST if WebSocket hasn't populated it
         setPotFilePreview(prev => {
           if (prev && prev.preview && prev.total_lines_shown > 0) return prev;
           return potPreview.status === 'fulfilled' ? potPreview.value : null;
         });
       } else {
         setJob(jobData);
-        // For non-completed jobs, still try to get logs
         try {
           const jobLogs = await jobApi.getJobLogs(jobId);
           setLogs(jobLogs.logs);
@@ -107,276 +98,103 @@ export default function JobDetailPage() {
 
   useEffect(() => {
     if (jobId) {
-      // Reset SSE flag when navigating to a different job
-      setSseInitialized(false);
-      setSseConnectionTrigger(prev => prev + 1);
       fetchJobDetails();
     }
   }, [jobId, fetchJobDetails]);
 
-  // Update refs when dependencies change
-  useEffect(() => {
-    fetchJobDetailsRef.current = fetchJobDetails;
-  }, [fetchJobDetails]);
+  // ── WebSocket event handlers ─────────────────────────────────────────────────
 
-  // Monitor status transitions to reset SSE when transitioning to active state
-  useEffect(() => {
-    if (job) {
-      const currentStatus = job.status.toLowerCase();
-      const prevStatus = prevStatusRef.current;
-      const isActive = ['queued', 'instance_creating', 'running'].includes(currentStatus);
+  const handleJobUpdate = useCallback((data: any) => {
+    setJob(prev => prev ? {
+      ...prev,
+      status: data.status,
+      status_message: data.status_message,
+      progress: data.progress,
+      error_message: data.error_message,
+      time_started: data.time_started,
+      time_finished: data.time_finished,
+      actual_cost: data.actual_cost,
+      estimated_time: data.estimated_time,
+    } : null);
+  }, []);
 
-      // Case 1: Initial page load with active job (no previous status)
-      if (!prevStatus && isActive && !sseInitialized) {
-        console.log('Job loaded in active state, triggering SSE connection');
-        setSseConnectionTrigger(prev => prev + 1);
-      }
-      // Case 2: Status transitioned from inactive to active
-      else if (prevStatus && !['queued', 'instance_creating', 'running'].includes(prevStatus) && isActive) {
-        console.log('Status transitioned to active, triggering SSE connection');
-        setSseInitialized(false);
-        setSseConnectionTrigger(prev => prev + 1);
-      }
+  const handleJobFinished = useCallback((data: any) => {
+    setJob(prev => prev ? {
+      ...prev,
+      status: data.status,
+      status_message: data.status_message,
+      progress: data.progress,
+      error_message: data.error_message,
+      time_started: data.time_started,
+      time_finished: data.time_finished,
+      actual_cost: data.actual_cost,
+    } : null);
 
-      // Update refs
-      prevStatusRef.current = currentStatus;
-      jobStatusRef.current = currentStatus;
+    // total_cracked is embedded in the job_finished payload – no REST follow-up needed
+    if (typeof data.total_cracked === 'number') {
+      setCrackedCount(prev => Math.max(prev, data.total_cracked));
     }
-  }, [job?.status, sseInitialized]);
+  }, []);
 
-  // SSE connection for real-time updates using fetch (supports credentials)
-  useEffect(() => {
-    // Wait for initial job data to load
-    if (!job || sseInitialized) return;
-
-    // Only connect for active jobs
-    const initialStatus = job.status.toLowerCase();
-    if (!['queued', 'instance_creating', 'running'].includes(initialStatus)) {
-      return;
-    }
-
-    // Mark as initialized so we don't reconnect on job state updates
-    setSseInitialized(true);
-
-    let abortController = new AbortController();
-    let shouldContinue = true;
-
-    const connectSSE = async () => {
-      try {
-        // Get auth token for Authorization header
-        const token = localStorage.getItem('access_token');
-        if (!token) {
-          console.error('No access token found');
-          return;
-        }
-
-        // Create SSE URL
-        const baseUrl = typeof window !== 'undefined' && window.location.hostname === 'localhost'
-          ? 'http://localhost:8000'
-          : (typeof window !== 'undefined' ? `${window.location.protocol}//${window.location.host}` : '');
-        const sseUrl = `${baseUrl}/api/v1/events/${jobId}/stream`;
-
-        console.log('Connecting to SSE via fetch:', sseUrl);
-
-        // Use fetch with credentials and Authorization header
-        const response = await fetch(sseUrl, {
-          method: 'GET',
-          headers: {
-            'Accept': 'text/event-stream',
-            'Authorization': `Bearer ${token}`,
-          },
-          credentials: 'include', // Send cookies
-          signal: abortController.signal,
-        });
-
-        if (!response.ok) {
-          throw new Error(`SSE connection failed: ${response.status} ${response.statusText}`);
-        }
-
-        if (!response.body) {
-          throw new Error('Response body is null');
-        }
-
-        console.log('SSE connection established');
-        setSseConnected(true);
-
-        // Read the stream
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = '';
-
-        while (shouldContinue) {
-          const { done, value } = await reader.read();
-
-          if (done) {
-            console.log('SSE stream ended');
-            break;
-          }
-
-          // Decode chunk and add to buffer
-          buffer += decoder.decode(value, { stream: true });
-
-          // Process complete events (separated by double newlines)
-          const events = buffer.split('\n\n');
-          buffer = events.pop() || ''; // Keep incomplete event in buffer
-
-          for (const eventText of events) {
-            if (!eventText.trim()) continue;
-
-            // Parse SSE event format
-            const lines = eventText.split('\n');
-            let eventType = 'message';
-            let eventData = '';
-
-            for (const line of lines) {
-              if (line.startsWith('event:')) {
-                eventType = line.substring(6).trim();
-              } else if (line.startsWith('data:')) {
-                eventData = line.substring(5).trim();
-              }
-            }
-
-            if (!eventData) continue;
-
-            try {
-              const data = JSON.parse(eventData);
-
-              // Handle different event types
-              switch (eventType) {
-                case 'job_update':
-                  console.log('Job update received:', data);
-                  setJob((prevJob: any) => prevJob ? {
-                    ...prevJob,
-                    status: data.status,
-                    status_message: data.status_message,
-                    progress: data.progress,
-                    error_message: data.error_message,
-                    time_started: data.time_started,
-                    time_finished: data.time_finished,
-                    actual_cost: data.actual_cost,
-                    estimated_time: data.estimated_time,
-                  } : null);
-                  break;
-
-                case 'log_update':
-                  console.log('Log update received:', data.lines?.length, 'lines');
-                  if (data.lines && data.lines.length > 0) {
-                    if (data.append) {
-                      setLogs((prevLogs: string) => prevLogs + '\n' + data.lines.join('\n'));
-                    } else {
-                      setLogs(data.lines.join('\n'));
-                    }
-                  }
-                  break;
-
-                case 'pot_update':
-                  console.log('Pot file update received:', data.total_cracked, 'passwords cracked');
-                  // Cracked count is monotonically increasing during a job.
-                  // Never decrease it - a lower value means we read a
-                  // truncated pot file on the backend.
-                  setCrackedCount(prev => Math.max(prev, data.total_cracked || 0));
-
-                  // Only update preview if the new data actually has content.
-                  // Avoid clobbering a valid preview with an empty one from a
-                  // transient file read.
-                  if (data.preview && data.preview.length > 0) {
-                    setPotFilePreview(prev => {
-                      const newCount = data.preview.length;
-                      const oldCount = prev?.total_lines_shown ?? 0;
-                      // Accept update if it has at least as many results
-                      if (newCount >= oldCount) {
-                        return {
-                          preview: data.preview.join('\n'),
-                          total_lines_shown: data.preview.length,
-                          truncated: data.truncated || false
-                        };
-                      }
-                      return prev;
-                    });
-                  }
-                  break;
-
-                case 'job_finished':
-                  console.log('Job finished:', data);
-                  setJob((prevJob: any) => prevJob ? {
-                    ...prevJob,
-                    status: data.status,
-                    status_message: data.status_message,
-                    progress: data.progress,
-                    error_message: data.error_message,
-                    time_started: data.time_started,
-                    time_finished: data.time_finished,
-                    actual_cost: data.actual_cost,
-                  } : null);
-                  // Fix 3: Fetch final data after a generous delay so the backend
-                  // has time to finish writing the pot file before we read it via
-                  // the REST preview endpoint. 100ms was too short and could race
-                  // against _retrieve_results() writing the final pot file.
-                  setTimeout(() => {
-                    if (fetchJobDetailsRef.current) {
-                      fetchJobDetailsRef.current();
-                    }
-                  }, 2000);
-                  shouldContinue = false;
-                  break;
-
-                case 'error':
-                  console.error('SSE error event:', data);
-                  shouldContinue = false;
-                  break;
-              }
-            } catch (parseError) {
-              console.error('Failed to parse SSE event data:', parseError, eventData);
-            }
-          }
-        }
-
-        setSseConnected(false);
-      } catch (error: any) {
-        console.error('SSE connection error:', error);
-        setSseConnected(false);
-
-        // Don't retry if we intentionally aborted (unmount / job change)
-        if (error.name !== 'AbortError' && !abortController.signal.aborted) {
-          console.log('SSE will retry connection in 5 seconds...');
-          // Retry connection after delay
-          setTimeout(() => {
-            if (!abortController.signal.aborted) {
-              connectSSE();
-            }
-          }, 5000);
-        }
+  const handleLogUpdate = useCallback((data: any) => {
+    if (data.lines && data.lines.length > 0) {
+      if (data.append) {
+        setLogs(prev => prev + '\n' + data.lines.join('\n'));
+      } else {
+        setLogs(data.lines.join('\n'));
       }
-    };
+    }
+  }, []);
 
-    connectSSE();
+  const handlePotUpdate = useCallback((data: any) => {
+    setCrackedCount(prev => Math.max(prev, data.total_cracked || 0));
 
-    // Cleanup on unmount or when jobId/trigger changes
-    return () => {
-      console.log('Cleaning up SSE connection');
-      shouldContinue = false;
-      abortController.abort();
-      setSseConnected(false);
-    };
-  }, [jobId, sseConnectionTrigger]); // Re-run when jobId or connection trigger changes
+    if (data.preview && data.preview.length > 0) {
+      setPotFilePreview(prev => {
+        const newCount = data.preview.length;
+        const oldCount = prev?.total_lines_shown ?? 0;
+        if (newCount >= oldCount) {
+          return {
+            preview: data.preview.join('\n'),
+            total_lines_shown: data.preview.length,
+            truncated: data.truncated || false,
+          };
+        }
+        return prev;
+      });
+    }
+  }, []);
 
-  // Auto-scroll to bottom when logs update
+  const { connected: wsConnected } = useJobWebSocket({
+    jobId,
+    active: isActive,
+    onJobUpdate: handleJobUpdate,
+    onJobFinished: handleJobFinished,
+    onLogUpdate: handleLogUpdate,
+    onPotUpdate: handlePotUpdate,
+    onError: (msg) => console.error('[WS] server error:', msg),
+  });
+
+  // ── Auto-scroll ──────────────────────────────────────────────────────────────
+
   useEffect(() => {
     if (autoScroll && logsEndRef.current) {
       logsEndRef.current.scrollIntoView({ behavior: 'smooth' });
     }
   }, [logs, autoScroll]);
 
-  // Update display every second for running jobs (elapsed time, current cost)
+  // ── Ticker for running jobs (elapsed time / cost display) ─────────────────────
+
   useEffect(() => {
-    if (job && ['queued', 'instance_creating', 'running'].includes(job.status.toLowerCase())) {
+    if (job && ACTIVE_STATUSES.includes(job.status.toLowerCase())) {
       const interval = setInterval(() => {
-        // Force re-render to update formatDuration and cost calculations
-        setJob((prev: any) => ({ ...prev }));
+        setJob(prev => prev ? { ...prev } : null);
       }, 1000);
       return () => clearInterval(interval);
     }
   }, [job?.status]);
+
+  // ── Action handlers ───────────────────────────────────────────────────────────
 
   const handleStartJob = async () => {
     setActionLoading(true);
@@ -410,7 +228,7 @@ export default function JobDetailPage() {
     setActionLoading(true);
     try {
       await jobApi.deleteJob(jobId);
-      router.push('/jobs'); // Redirect to jobs list after deletion
+      router.push('/jobs');
     } catch (err: any) {
       setError(err.response?.data?.detail || 'Failed to delete job');
       setActionLoading(false);
@@ -419,25 +237,16 @@ export default function JobDetailPage() {
 
   const handleDownloadResults = async () => {
     if (!job) return;
-    
+
     try {
-      // Get the full potfile content
       const response = await jobApi.getPotFile(jobId);
-      
-      // Create a blob with the content
       const blob = new Blob([response], { type: 'text/plain' });
-      
-      // Create download link
       const url = window.URL.createObjectURL(blob);
       const link = document.createElement('a');
       link.href = url;
       link.download = `${job.name}_cracked_passwords.txt`;
-      
-      // Trigger download
       document.body.appendChild(link);
       link.click();
-      
-      // Cleanup
       document.body.removeChild(link);
       window.URL.revokeObjectURL(url);
     } catch (err: any) {
@@ -445,12 +254,11 @@ export default function JobDetailPage() {
     }
   };
 
+  // ── Helpers ───────────────────────────────────────────────────────────────────
+
   const formatDate = (dateString?: string) => {
     if (!dateString) {
-      // Show '-' for running jobs where time_finished is not set yet
-      if (job && ['queued', 'instance_creating', 'running'].includes(job.status.toLowerCase())) {
-        return '-';
-      }
+      if (job && ACTIVE_STATUSES.includes(job.status.toLowerCase())) return '-';
       return 'Not started';
     }
     return new Date(dateString).toLocaleString();
@@ -458,17 +266,13 @@ export default function JobDetailPage() {
 
   const formatDuration = (start?: string, end?: string) => {
     if (!start) return 'N/A';
-
-    // Calculate elapsed time (use current time if job still running)
     const startTime = new Date(start).getTime();
     const endTime = end ? new Date(end).getTime() : Date.now();
     const duration = endTime - startTime;
-
     const seconds = Math.floor(duration / 1000);
     const minutes = Math.floor(seconds / 60);
     const hours = Math.floor(minutes / 60);
     const days = Math.floor(hours / 24);
-
     if (days > 0) return `${days}d ${hours % 24}h`;
     if (hours > 0) return `${hours}h ${minutes % 60}m`;
     if (minutes > 0) return `${minutes}m ${seconds % 60}s`;
@@ -491,23 +295,12 @@ export default function JobDetailPage() {
     }
   };
 
-  const getStatusColor = (status: string) => {
-    const lowerStatus = status.toLowerCase();
-    switch (lowerStatus) {
-      case 'completed': return 'text-green-600';
-      case 'failed': return 'text-red-600';
-      case 'running': return 'text-blue-600';
-      case 'cancelled': return 'text-gray-600';
-      default: return 'text-yellow-600';
-    }
-  };
-
   const getStatusBadgeColor = (status: string) => {
     const lowerStatus = status.toLowerCase();
     switch (lowerStatus) {
-      case 'completed': 
+      case 'completed':
         return 'bg-emerald-900/30 text-emerald-400 border border-emerald-500/50';
-      case 'failed': 
+      case 'failed':
         return 'bg-red-900/30 text-red-400 border border-red-500/50';
       case 'running':
       case 'instance_creating':
@@ -521,6 +314,8 @@ export default function JobDetailPage() {
         return 'bg-slate-800/50 text-slate-300 border border-slate-600/50';
     }
   };
+
+  // ── Render ────────────────────────────────────────────────────────────────────
 
   if (loading) {
     return (
@@ -570,7 +365,7 @@ export default function JobDetailPage() {
                     <h1 className="text-3xl font-bold text-slate-100 tracking-tight">{job.name}</h1>
                     <p className="text-slate-400 mt-1 font-medium">Hash type: <span className="text-blue-400">{job.hash_type}</span></p>
                   </div>
-                  
+
                   {/* Status Section */}
                   <div className="space-y-3">
                     <div className="flex items-center space-x-3">
@@ -582,7 +377,7 @@ export default function JobDetailPage() {
                         {formatDate(job.created_at)}
                       </div>
                     </div>
-                    
+
                     {/* Progress Bar */}
                     {job.progress > 0 && (
                       <div className="space-y-2">
@@ -592,7 +387,7 @@ export default function JobDetailPage() {
                         </div>
                         <div className="relative">
                           <div className="w-80 bg-slate-700/50 rounded-full h-3">
-                            <div 
+                            <div
                               className="bg-gradient-to-r from-blue-500 to-emerald-500 h-3 rounded-full transition-all duration-700 ease-out"
                               style={{ width: `${job.progress}%` }}
                             />
@@ -600,9 +395,9 @@ export default function JobDetailPage() {
                         </div>
                       </div>
                     )}
-                    
+
                     {/* Status Message */}
-                    {job.status_message && ['queued', 'instance_creating', 'running'].includes(job.status.toLowerCase()) && (
+                    {job.status_message && ACTIVE_STATUSES.includes(job.status.toLowerCase()) && (
                       <div className="bg-blue-900/20 border-l-4 border-blue-500 rounded-r-lg p-4">
                         <div className="flex items-start">
                           <Loader2 className="h-4 w-4 animate-spin text-blue-400 mt-0.5 mr-3 flex-shrink-0" />
@@ -615,11 +410,11 @@ export default function JobDetailPage() {
                   </div>
                 </div>
               </div>
-            
+
               <div className="flex space-x-2">
                 {job.status.toLowerCase() === 'ready_to_start' && (
-                  <Button 
-                    onClick={handleStartJob} 
+                  <Button
+                    onClick={handleStartJob}
                     loading={actionLoading}
                     className="bg-gradient-to-r from-emerald-600 to-emerald-700 hover:from-emerald-500 hover:to-emerald-600 text-white border-0 rounded-lg font-semibold shadow-lg transition-all duration-200 px-4 py-2"
                   >
@@ -627,10 +422,10 @@ export default function JobDetailPage() {
                     Start Job
                   </Button>
                 )}
-                {['queued', 'instance_creating', 'running'].includes(job.status.toLowerCase()) && (
-                  <Button 
-                    variant="destructive" 
-                    onClick={handleStopJob} 
+                {ACTIVE_STATUSES.includes(job.status.toLowerCase()) && (
+                  <Button
+                    variant="destructive"
+                    onClick={handleStopJob}
                     loading={actionLoading}
                     className="bg-gradient-to-r from-red-600 to-red-700 hover:from-red-500 hover:to-red-600 text-white border-0 rounded-lg font-semibold shadow-lg transition-all duration-200 px-4 py-2"
                   >
@@ -639,8 +434,8 @@ export default function JobDetailPage() {
                   </Button>
                 )}
                 {(crackedCount > 0 || (job.cracked_hashes !== undefined && job.cracked_hashes > 0)) && (
-                  <Button 
-                    variant="outline" 
+                  <Button
+                    variant="outline"
                     onClick={handleDownloadResults}
                     className="border-blue-500/50 text-blue-400 hover:bg-blue-900/20 hover:text-blue-300 hover:border-blue-400 bg-transparent rounded-lg font-semibold shadow-md transition-all duration-200 px-4 py-2"
                   >
@@ -649,9 +444,9 @@ export default function JobDetailPage() {
                   </Button>
                 )}
                 {!['queued', 'instance_creating', 'running', 'cancelling'].includes(job.status.toLowerCase()) && (
-                  <Button 
-                    variant="outline" 
-                    onClick={handleDeleteJob} 
+                  <Button
+                    variant="outline"
+                    onClick={handleDeleteJob}
                     loading={actionLoading}
                     className="border-red-500/50 text-red-400 hover:bg-red-900/20 hover:text-red-300 hover:border-red-400 bg-transparent rounded-lg font-semibold shadow-md transition-all duration-200 px-4 py-2"
                   >
@@ -712,6 +507,37 @@ export default function JobDetailPage() {
                     </div>
                   )}
                 </div>
+                {/* Attack Configuration */}
+                {(job.word_list || (job.rule_files && job.rule_files.length > 0) || job.custom_attack) && (
+                  <div className="pt-4 border-t border-slate-700/50 space-y-4">
+                    {job.word_list && (
+                      <div className="space-y-1">
+                        <span className="text-slate-400 text-xs font-medium uppercase tracking-wider">Wordlist</span>
+                        <p className="text-slate-200 font-medium font-mono text-sm">{job.word_list.split('/').pop()}</p>
+                      </div>
+                    )}
+                    {job.rule_files && job.rule_files.length > 0 && (
+                      <div className="space-y-1">
+                        <span className="text-slate-400 text-xs font-medium uppercase tracking-wider">
+                          {job.rule_files.length === 1 ? 'Rule' : 'Rules'}
+                        </span>
+                        <div className="flex flex-wrap gap-1.5">
+                          {job.rule_files.map((rule, i) => (
+                            <span key={i} className="text-xs font-mono text-violet-300 bg-violet-900/30 border border-violet-500/30 px-2 py-0.5 rounded">
+                              {rule.split('/').pop()}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                    {job.custom_attack && !job.word_list && (
+                      <div className="space-y-1">
+                        <span className="text-slate-400 text-xs font-medium uppercase tracking-wider">Custom Attack</span>
+                        <p className="text-slate-200 font-mono text-xs bg-slate-800/60 border border-slate-600/50 rounded px-2 py-1 break-all">{job.custom_attack}</p>
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
             </CardContent>
           </Card>
@@ -741,7 +567,7 @@ export default function JobDetailPage() {
                       <span className="text-2xl font-bold text-blue-400 block mt-2">{job.success_rate ?? 0}%</span>
                     </div>
                   </div>
-                  
+
                   {/* Progress Bar */}
                   <div className="space-y-3">
                     <div className="flex justify-between text-sm">
@@ -750,7 +576,7 @@ export default function JobDetailPage() {
                     </div>
                     <div className="relative">
                       <div className="w-full bg-slate-700/50 rounded-full h-3">
-                        <div 
+                        <div
                           className="bg-gradient-to-r from-emerald-500 to-emerald-600 h-3 rounded-full transition-all duration-700 ease-out"
                           style={{ width: `${job.success_rate ?? 0}%` }}
                         />
@@ -771,10 +597,10 @@ export default function JobDetailPage() {
               <CardTitle className="flex items-center text-slate-200">
                 <Key className="h-5 w-5 mr-2 text-orange-400" />
                 Cracked Passwords
-                {(crackedCount > 0 || job.cracked_hashes !== undefined) && (
+                {(crackedCount > 0 || (job.cracked_hashes !== undefined && job.cracked_hashes > 0)) && (
                   <span className="ml-2 text-sm bg-orange-900/30 text-orange-400 border border-orange-500/50 px-2 py-1 rounded-md flex items-center">
                     {crackedCount > 0 ? crackedCount : job.cracked_hashes} found
-                    {sseConnected && crackedCount > 0 && (
+                    {wsConnected && crackedCount > 0 && (
                       <span className="ml-2 w-2 h-2 bg-green-400 rounded-full animate-pulse"></span>
                     )}
                   </span>
@@ -807,11 +633,10 @@ export default function JobDetailPage() {
                   {potFilePreview?.preview ? (
                     <div className="space-y-1">
                       {potFilePreview.preview.split('\n').filter(line => line.trim()).map((line, index) => {
-                        // Split on the last ':' to handle complex hashes like NTLMv2
                         const lastColonIndex = line.lastIndexOf(':');
                         const hash = lastColonIndex !== -1 ? line.substring(0, lastColonIndex) : line;
                         const password = lastColonIndex !== -1 ? line.substring(lastColonIndex + 1) : '';
-                        
+
                         return (
                           <div key={index} className="group hover:bg-slate-700/30 rounded px-2 py-1 transition-colors">
                             <div className="flex flex-col space-y-1">
@@ -862,11 +687,11 @@ export default function JobDetailPage() {
                     <span className="text-xs font-medium text-slate-300 uppercase tracking-wider">Job Execution Output</span>
                     <div className="flex items-center space-x-3">
                       {/* Connection Status */}
-                      {['queued', 'instance_creating', 'running'].includes(job?.status?.toLowerCase() || '') && (
+                      {ACTIVE_STATUSES.includes(job?.status?.toLowerCase() || '') && (
                         <div className="flex items-center space-x-2">
-                          <div className={`w-2 h-2 rounded-full ${sseConnected ? 'bg-green-400 animate-pulse' : 'bg-red-400'}`}></div>
+                          <div className={`w-2 h-2 rounded-full ${wsConnected ? 'bg-green-400 animate-pulse' : 'bg-red-400'}`}></div>
                           <span className="text-xs text-slate-400">
-                            {sseConnected ? 'Live' : 'Disconnected'}
+                            {wsConnected ? 'Live' : 'Connecting…'}
                           </span>
                         </div>
                       )}
@@ -889,12 +714,11 @@ export default function JobDetailPage() {
                       {logs.split('\n').map((line, index) => {
                         const trimmedLine = line.trim();
                         if (!trimmedLine) return null;
-                        
-                        // Color coding for different log levels
+
                         let lineColor = 'text-slate-300';
                         let bgColor = '';
                         let prefix = '';
-                        
+
                         if (trimmedLine.toLowerCase().includes('error') || trimmedLine.toLowerCase().includes('failed')) {
                           lineColor = 'text-red-400';
                           bgColor = 'bg-red-900/20';
@@ -911,7 +735,7 @@ export default function JobDetailPage() {
                           lineColor = 'text-blue-400';
                           prefix = 'ℹ️';
                         }
-                        
+
                         return (
                           <div key={index} className={`group hover:bg-slate-700/30 rounded px-2 py-1 transition-colors ${bgColor}`}>
                             <div className="flex items-start space-x-2">
@@ -935,7 +759,7 @@ export default function JobDetailPage() {
                     <div className="text-center py-8">
                       <Target className="h-8 w-8 text-slate-500 mx-auto mb-2" />
                       <p className="text-sm text-slate-400">No execution logs available yet</p>
-                      {['queued', 'instance_creating', 'running'].includes(job.status.toLowerCase()) && (
+                      {ACTIVE_STATUSES.includes(job.status.toLowerCase()) && (
                         <p className="text-xs text-blue-400 mt-1">Logs will appear when job execution begins</p>
                       )}
                     </div>
@@ -949,3 +773,4 @@ export default function JobDetailPage() {
     </Layout>
   );
 }
+

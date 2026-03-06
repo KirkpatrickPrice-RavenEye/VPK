@@ -164,7 +164,7 @@ export interface Job {
   name: string;
   hash_type: string;
   word_list?: string;
-  rule_list?: string;
+  rule_files?: string[];
   custom_attack?: string;
   hard_end_time?: string;
   instance_type?: string;
