@@ -55,7 +55,8 @@ export default function JobDetailPage() {
     try {
       const jobData = await jobApi.getJob(jobId);
 
-      if (jobData.status.toLowerCase() === 'completed') {
+      const terminalStatuses = ['completed', 'cancelled', 'failed'];
+      if (terminalStatuses.includes(jobData.status.toLowerCase())) {
         const [stats, logsResult, potPreview] = await Promise.allSettled([
           jobApi.getJobStats(jobId),
           jobApi.getJobLogs(jobId),

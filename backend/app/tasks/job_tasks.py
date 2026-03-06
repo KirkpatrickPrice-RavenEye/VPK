@@ -452,7 +452,17 @@ def _handle_job_timeout(job: Job, db: Session, is_soft_timeout: bool = True):
         # Final database update
         job.error_message = f"Job execution cancelled due to time limit exceeded ({'soft' if is_soft_timeout else 'hard'} timeout at {datetime.now(timezone.utc)})"
         db.commit()
-        _publish_job_finished(job)
+
+        _final_cracked = 0
+        if job.pot_file_path and os.path.isfile(job.pot_file_path):
+            try:
+                with open(job.pot_file_path, "r") as _pf:
+                    _final_cracked = sum(
+                        1 for ln in _pf if ln.strip() and not ln.startswith("#")
+                    )
+            except Exception:
+                pass
+        _publish_job_finished(job, total_cracked=_final_cracked)
 
         logger.info(f"Timeout cleanup completed for job {job.id}")
 
@@ -464,7 +474,16 @@ def _handle_job_timeout(job: Job, db: Session, is_soft_timeout: bool = True):
             job.error_message = f"Job failed due to timeout and cleanup error: {str(e)}"
             job.time_finished = datetime.now(timezone.utc)
             db.commit()
-            _publish_job_finished(job)
+            _final_cracked = 0
+            if job.pot_file_path and os.path.isfile(job.pot_file_path):
+                try:
+                    with open(job.pot_file_path, "r") as _pf:
+                        _final_cracked = sum(
+                            1 for ln in _pf if ln.strip() and not ln.startswith("#")
+                        )
+                except Exception:
+                    pass
+            _publish_job_finished(job, total_cracked=_final_cracked)
         except Exception as db_error:
             logger.error(
                 f"Failed to update job status during timeout cleanup: {db_error}"
@@ -3025,7 +3044,17 @@ def stop_job(job_id: str):
         # Step 5: Final status update
         job.status = JobStatus.CANCELLED
         db.commit()
-        _publish_job_finished(job)
+
+        _final_cracked = 0
+        if job.pot_file_path and os.path.isfile(job.pot_file_path):
+            try:
+                with open(job.pot_file_path, "r") as _pf:
+                    _final_cracked = sum(
+                        1 for ln in _pf if ln.strip() and not ln.startswith("#")
+                    )
+            except Exception:
+                pass
+        _publish_job_finished(job, total_cracked=_final_cracked)
 
         return {"status": "stopped", "job_id": job_id, "instance_destroyed": True}
 
